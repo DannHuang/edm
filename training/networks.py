@@ -113,17 +113,34 @@ class GroupNorm(torch.nn.Module):
 class AttentionOp(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k):
-        w = torch.einsum('ncq,nck->nqk', q.to(torch.float32), (k / np.sqrt(k.shape[1])).to(torch.float32)).softmax(dim=2).to(q.dtype)
-        ctx.save_for_backward(q, k, w)
-        return w
+        b = torch.einsum('ncq,nck->nqk', q.to(torch.float32), (k / np.sqrt(k.shape[1])).to(torch.float32))
+        ctx.save_for_backward(q, k)
+        ctx.interm = (q,k)
+        return b
 
     @staticmethod
-    def backward(ctx, dw):
-        q, k, w = ctx.saved_tensors
-        db = torch._softmax_backward_data(grad_output=dw.to(torch.float32), output=w.to(torch.float32), dim=2, input_dtype=torch.float32)
+    def backward(ctx, db):
+        q, k = ctx.saved_tensors
+        # db = torch._softmax_backward_data(grad_output=dw.to(torch.float32), output=w.to(torch.float32), dim=2, input_dtype=torch.float32)
         dq = torch.einsum('nck,nqk->ncq', k.to(torch.float32), db).to(q.dtype) / np.sqrt(k.shape[1])
         dk = torch.einsum('ncq,nqk->nck', q.to(torch.float32), db).to(k.dtype) / np.sqrt(k.shape[1])
         return dq, dk
+
+    @staticmethod
+    def jvp(ctx, jv_q, jv_k):
+        '''
+        jv_q.shape = q.shape, jv_k.shape = k.shape
+        Jessen_q(QK) @ jv_q, Jessen_k(QK) @ jv_k
+        '''
+        # assert torch.isnan(jv_q).sum() == 0, 'NaN encounter in FWAD: AttentionOp, jv_q'
+        # assert torch.isnan(jv_k).sum() == 0, 'NaN encounter in FWAD: AttentionOp, jv_k'
+        q, k = ctx.interm
+        jv_b_q = torch.einsum('ncq,nck->nqk', jv_q.to(torch.float32), k.to(torch.float32)).to(q.dtype) / np.sqrt(k.shape[1])
+        jv_b_k = torch.einsum('ncq,nck->nqk', q.to(torch.float32), jv_k.to(torch.float32)).to(q.dtype) / np.sqrt(k.shape[1])
+        jv_b = jv_b_q + jv_b_k
+        del ctx.interm
+        # assert torch.isnan(jv_b).sum() == 0, 'NaN encounter in FWAD: AttentionOp, jv_b'
+        return jv_b
 
 #----------------------------------------------------------------------------
 # Unified U-Net block with optional up/downsampling and self-attention.
@@ -180,7 +197,8 @@ class UNetBlock(torch.nn.Module):
 
         if self.num_heads:
             q, k, v = self.qkv(self.norm2(x)).reshape(x.shape[0] * self.num_heads, x.shape[1] // self.num_heads, 3, -1).unbind(2)
-            w = AttentionOp.apply(q, k)
+            b = AttentionOp.apply(q, k)
+            w = b.softmax(dim=2).to(q.dtype)
             a = torch.einsum('nqk,nck->ncq', w, v)
             x = self.proj(a.reshape(*x.shape)).add_(x)
             x = x * self.skip_scale
