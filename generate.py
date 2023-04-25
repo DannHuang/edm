@@ -19,15 +19,17 @@ import PIL.Image
 import dnnlib
 from torch_utils import distributed as dist
 from torch.autograd.functional import jvp
+import torch.autograd.forward_ad as fwAD
 
 #----------------------------------------------------------------------------
-# Proposed EDM sampler (Algorithm 2).
+# Original EDM sampler (Algorithm 2).
 
-def edm_sampler_(
+def edm_sampler(
     net, latents, class_labels=None, randn_like=torch.randn_like,
     num_steps=18, sigma_min=0.002, sigma_max=80, rho=7,
     S_churn=0, S_min=0, S_max=float('inf'), S_noise=1,
 ):
+
     # Adjust noise levels based on what's supported by the network.
     sigma_min = max(sigma_min, net.sigma_min)
     sigma_max = min(sigma_max, net.sigma_max)
@@ -37,29 +39,6 @@ def edm_sampler_(
     step_indices = torch.arange(num_steps, dtype=torch.float64, device=latents.device)
     t_steps = (A + step_indices/(num_steps-1)*B) ** rho
     t_steps = torch.cat([net.round_sigma(t_steps), torch.zeros_like(t_steps[:1])]) # t_N = 0
-    
-    # # approximation of (t_next - t_cur)
-    # d_sigma = []
-    # d_t_sigma = []
-    # d_t = []
-    # for _, (t_cur, t_next) in enumerate(zip(t_steps[:-1], t_steps[1:])): # 0, ..., N-1
-
-    #     # gamma = min(S_churn / num_steps, 2**0.5 - 1) if S_min <= t_cur <= S_max else 0
-    #     # t_hat = net.round_sigma(t_cur + gamma * t_cur)
-    #     # print(f'gamma={gamma}, dt={(t_next**(1/rho) - t_hat**(1/rho))}')
-
-    #     d_sigma.append((t_next**2))
-    #     dt = (t_next**(1/rho) - t_cur**(1/rho))/B
-    #     d_t.append(dt)
-    #     dtsigma = dt *B*rho * (3/3*t_cur**((rho-1)/rho)+0/3*t_next**((rho-1)/rho)) + 0.5*dt*dt*rho*(rho-1)*B*B * (6/6*t_cur**((rho-2)/rho)+0/12*t_next**((rho-2)/rho))
-    #     d_t_sigma.append((t_cur + dtsigma)**2)
-    #     # d_t_sigma.append(dt *B*rho * (t_cur**((rho-1)/rho)+t_next**((rho-1)/rho))/2)
-    # d_t_sigma = torch.tensor(d_t_sigma, device='cuda')
-    # d_sigma = torch.tensor(d_sigma, device='cuda')
-    # d_t = torch.tensor(d_t, device='cuda')
-    # # print(d_t)
-    # print(((d_t_sigma-d_sigma)**2).sum().sqrt())
-    # exit()
 
     # Main sampling loop.
     x_next = latents.to(torch.float64) * t_steps[0]
@@ -68,6 +47,7 @@ def edm_sampler_(
 
         # Increase noise temporarily.
         gamma = min(S_churn / num_steps, 2**0.5 - 1) if S_min <= t_cur <= S_max else 0
+        # if S_min <= t_cur <= S_max: count+=1
         t_hat = net.round_sigma(t_cur + gamma * t_cur)
         if randn_like.__name__ == 'multiGaussian_like':
             correlated_noise = randn_like(x_cur, (t_cur**(1/rho)-t_hat**(1/rho))/B)
@@ -84,7 +64,7 @@ def edm_sampler_(
         # Jf = ((d_cur-Jf) /t_hat *2*rho*B/(x_hat)**(1/rho)).to(torch.float64)
         
         # # dx = -eps_t * B*dt * 
-        dt = (t_next**(1/rho) - t_hat**(1/rho))/B
+        # dt = (t_next**(1/rho) - t_hat**(1/rho))/B
         # x_next = x_hat + d_cur * dt * (B*rho*t_hat**((rho-1)/rho) + 0.5*rho*(rho-1)*B*B*dt * t_hat**((rho-2)/rho))
         # x_next = x_hat + d_cur * dt * B*rho * ((t_hat**((rho-1)/rho)+t_next**((rho-1)/rho)) + 0.5*(rho-1)*B*dt * (t_hat**((rho-2)/rho)+t_next**((rho-2)/rho)))/2
         # # dx = -eps_t * d(sigma_t)
@@ -95,32 +75,17 @@ def edm_sampler_(
         # x_next = x_hat + d_cur * (t_next**(1/rho) - t_hat**(1/rho)) * rho * (t_hat**((rho-1)/rho)+t_next**((rho-1)/rho))/2 + Jf*((t_next**(1/rho) - t_hat**(1/rho))/B)**2
 
         # Apply 2nd order correction.
-        # if i < num_steps - 1:
-        #     denoised = net(x_next, t_next, class_labels).to(torch.float64)
-        #     d_prime = (x_next - denoised) / t_next
+        if i < num_steps - 1:
+            denoised = net(x_next, t_next, class_labels).to(torch.float64)
+            d_prime = (x_next - denoised) / t_next
 
-        #     _, Jf=jvp(net, (x_next, t_next, class_labels), (d_prime,torch.zeros_like(t_cur),torch.zeros_like(class_labels)))
-        #     Jf = ((d_prime-Jf) /t_next ).to(torch.float64)
-
-        #     x_next = x_hat + (0.5 * d_cur + 0.5 * d_prime) * (t_next**(1/rho) - t_hat**(1/rho)) * rho/2 * (t_hat**((rho-1)/rho)+t_next**((rho-1)/rho))
-        #     # x_next = x_hat + (0.5 * d_cur + 0.5 * d_prime) * (t_next - t_hat)
-        #     # x_next = x_hat + (0.5 * d_cur + 0.5 * d_prime + (t_next**(1/rho) - t_hat**(1/rho)) * rho/2 * (t_hat**((rho-1)/rho)+t_next**((rho-1)/rho))*Jf) * (t_next**(1/rho) - t_hat**(1/rho)) * rho/2 * (t_hat**((rho-1)/rho)+t_next**((rho-1)/rho))
-        
-        # # backward difference
-        # if i > 0:
-        #     # _, Jf=jvp(net, (x_next, t_next, class_labels), (d_prime,torch.zeros_like(t_cur),torch.zeros_like(class_labels)))
-        #     # Jf = ((d_prime-Jf) /t_next ).to(torch.float64)
-        #     # print((Jf**2).sum().sqrt())
-        #     # print((d_prime**2).sum().sqrt())
-
-        #     x_next = x_hat + (0.5 * d_cur + 0.5 * d_last) * (t_next**(1/rho) - t_hat**(1/rho)) * rho/2 * (t_hat**((rho-1)/rho)+t_last**((rho-1)/rho))
-        #     # x_next = x_hat + (t_next - t_hat) * (0.5 * d_cur + 0.5 * d_prime + (t_next - t_hat)*Jf)
-        # d_last = d_cur
-        # t_last = t_hat
-
+            # x_next = x_hat + (0.5 * d_cur + 0.5 * d_prime) * (t_next**(1/rho) - t_hat**(1/rho)) * rho/2 * (t_hat**((rho-1)/rho)+t_next**((rho-1)/rho))
+            x_next = x_hat + (0.5 * d_cur + 0.5 * d_prime) * (t_next - t_hat)
+            # # 2nd order
+            # x_next = x_hat + (0.5 * d_cur + 0.5 * d_prime + (t_next**(1/rho) - t_hat**(1/rho)) * rho/2 * (t_hat**((rho-1)/rho)+t_next**((rho-1)/rho))*Jf) * (t_next**(1/rho) - t_hat**(1/rho)) * rho/2 * (t_hat**((rho-1)/rho)+t_next**((rho-1)/rho))
     return x_next
 
-def edm_sampler(
+def edm_sampler_(
     net, latents, class_labels=None, randn_like=torch.randn_like,
     num_steps=18, sigma_min=0.002, sigma_max=80, rho=7,
     S_churn=0, S_min=0, S_max=float('inf'), S_noise=1,
@@ -128,12 +93,13 @@ def edm_sampler(
     # Adjust noise levels based on what's supported by the network.
     sigma_min = max(sigma_min, net.sigma_min)
     sigma_max = min(sigma_max, net.sigma_max)
-    A = sigma_max ** (1 / rho)
-    B = (sigma_min ** (1 / rho) - sigma_max ** (1 / rho))
+    A = torch.tensor(sigma_max ** (1 / rho), dtype=torch.float64)
+    B = torch.tensor(sigma_min ** (1 / rho) - sigma_max ** (1 / rho), dtype=torch.float64)
     # Time step discretization, turn time-steps into sigma-schedule
     step_indices = torch.arange(num_steps, dtype=torch.float64, device=latents.device)
     t_steps = (A + step_indices/(num_steps-1)*B) ** rho
     t_steps = torch.cat([net.round_sigma(t_steps), torch.zeros_like(t_steps[:1])]) # t_N = 0
+    dt = torch.tensor(1/(num_steps-1), dtype=torch.float64)
 
     # Main sampling loop.
     x_next = latents.to(torch.float64) * t_steps[0]
@@ -143,29 +109,15 @@ def edm_sampler(
         # Euler step.
         denoised = net(x_cur, t_cur, class_labels).to(torch.float64)
         d_cur = (x_cur - denoised) / t_cur
-        # _, Jf=jvp(net, (x_cur, t_cur, class_labels), (d_cur,torch.zeros_like(t_cur),torch.zeros_like(class_labels)))
 
-        dt = (t_next**(1/rho) - t_cur**(1/rho))/B       # positive dt
-        # gamma = dt * (B*rho*(t_cur**((rho-1)/rho)) + 0.5*dt*rho*(rho-1)*B*B*(t_cur**((rho-2)/rho)))
-        # Jf = (gamma**2*(d_cur-Jf)/t_cur).to(torch.float64)
-        x_next = x_cur + d_cur*dt * (B*rho*(t_cur**((rho-1)/rho)) + 0.5*dt*rho*(rho-1)*B*B*(t_cur**((rho-2)/rho)))
-        # # dx = -eps_t * d(sigma_t)
-        # x_next = x_hat + d_cur * (t_next - t_hat)       # negative delta-t here (t_next - t_hat)
+        if i == num_steps-1 : dt = (t_next**(1/rho) - t_cur**(1/rho))/B       # positive dt
+        gamma = (B*rho*(t_cur**((rho-1)/rho)) + 0.5*dt*rho*(rho-1)*B*B*(t_cur**((rho-2)/rho)))
+        x_next = x_cur + gamma*d_cur*dt
         
-        # 2nd order deriviatives
-        # x_next = x_hat + d_cur * (t_next**(1/rho) - t_hat**(1/rho)) * rho * (t_hat**((rho-1)/rho)+t_next**((rho-1)/rho))/2 + Jf*((t_next**(1/rho) - t_hat**(1/rho))/B)**2
-
-        # Apply 2nd order correction.
-        if i < num_steps - 1:
-            denoised = net(x_next, t_next, class_labels).to(torch.float64)
-            d_prime = (x_next - denoised) / t_next
-
-            # _, Jf=jvp(net, (x_next, t_next, class_labels), (d_prime,torch.zeros_like(t_cur),torch.zeros_like(class_labels)))
-            # Jf = ((d_prime-Jf) /t_next ).to(torch.float64)
-
-            x_next = x_cur + 0.5*(d_cur+d_prime)*dt * (B*rho*(t_cur**((rho-1)/rho)) + 0.5*dt*rho*(rho-1)*B*B*(t_cur**((rho-2)/rho)))
-            # x_next = x_cur + (0.5 * d_cur + 0.5 * d_prime) * (t_next - t_cur)
-            # x_next = x_hat + (0.5 * d_cur + 0.5 * d_prime + (t_next**(1/rho) - t_hat**(1/rho)) * rho/2 * (t_hat**((rho-1)/rho)+t_next**((rho-1)/rho))*Jf) * (t_next**(1/rho) - t_hat**(1/rho)) * rho/2 * (t_hat**((rho-1)/rho)+t_next**((rho-1)/rho))
+        # # 2nd order deriviatives
+        # _, Jf=jvp(net, (x_cur, t_cur, class_labels), (d_cur,torch.zeros_like(t_cur),torch.zeros_like(class_labels)))
+        # Jf = (gamma**2*(d_cur-Jf)/t_cur).to(torch.float64)
+        # x_next = x_cur + d_cur*gamma*dt + 0.5*dt*dt*Jf
         
         # # backward difference
         # if i > 0:
@@ -179,79 +131,90 @@ def edm_sampler(
         # d_last = d_cur
         # t_last = t_hat
         
-        k=2         # hyper-param, range=[0,]
+        k=6         # hyper-param, range=[1,], optimal=6
         if randn_like.__name__ == 'multiGaussian_like':
             correlated_noise = randn_like(x_cur, dt)
-            x_next = x_next + (dt*((1+k)/2))*(rho*(rho-1)*B*B*(t_cur**((2*rho-2)/rho))).sqrt() * S_noise*correlated_noise[0]
+            # _, JL=jvp(net, (x_cur, t_cur, class_labels), (correlated_noise[1],torch.zeros_like(t_cur),torch.zeros_like(class_labels)))
+            x_next = x_next + (dt**((1+k)/2))*(rho*(rho-1)*B*B*(t_cur**((2*rho-2)/rho))).sqrt() * S_noise*correlated_noise[0]
         else:
             # # beta * g(t) = (dt)^0.5 * (sigma^2_t)'^0.5
             x_next = x_next + (dt**((2+k)/2))*(rho*(rho-1)*B*B*(t_cur**((2*rho-2)/rho))).sqrt() * S_noise*randn_like(x_cur)
             # x_hat = x_cur + (t_hat ** 2 - t_cur ** 2).sqrt() * S_noise*randn_like(x_cur)
+        
+        # # # Heun's method
+        # if i < num_steps - 1:
+        #     denoised = net(x_next, t_next, class_labels).to(torch.float64)
+        #     gamma_next = (B*rho*(t_next**((rho-1)/rho)) + 0.5*dt*rho*(rho-1)*B*B*(t_next**((rho-2)/rho)))
+        #     d_prime = (x_next - denoised) / t_next
+        #     x_next = x_cur + 0.5*(d_cur*gamma+d_prime*gamma)*dt
 
     return x_next
 
-def edm_sampler_2nd(
+def edm_sampler_2(
     net, latents, class_labels=None, randn_like=torch.randn_like,
     num_steps=18, sigma_min=0.002, sigma_max=80, rho=7,
     S_churn=0, S_min=0, S_max=float('inf'), S_noise=1,
 ):
-    '''
-    Input:
-            latents: standard Gaussian noise x_T
-    '''
+
     # Adjust noise levels based on what's supported by the network.
     sigma_min = max(sigma_min, net.sigma_min)
     sigma_max = min(sigma_max, net.sigma_max)
-    A = sigma_max ** (1 / rho)
-    B = (sigma_min ** (1 / rho) - sigma_max ** (1 / rho))
+    A = torch.tensor(sigma_max**(1/rho), dtype=torch.float64)
+    B = torch.tensor(sigma_min**(1/rho) - sigma_max**(1/rho), dtype=torch.float64)
     # Time step discretization, turn time-steps into sigma-schedule
     # t_steps = sigma-schedule
     step_indices = torch.arange(num_steps, dtype=torch.float64, device=latents.device)  # [0,1,...,num_steps-1]
-    t_steps = (A + step_indices/(num_steps-1)*B) ** rho
-    t_steps = torch.cat([net.round_sigma(t_steps), torch.zeros_like(t_steps[:1])]) # t_steps[num_steps] = 0
+    sigmas = (A + step_indices/(num_steps-1)*B).pow(rho)
+    sigmas = torch.cat([net.round_sigma(sigmas), torch.zeros_like(sigmas[:1])]) # t_steps[num_steps] = 0
+    dt = torch.tensor(1/(num_steps-1), dtype=torch.float64, device=latents.device)
     # # t_steps = [sigma_max, ..., sigma_min, 0]
 
     # Main sampling loop.
-    x_cur = latents.to(torch.float64) * t_steps[0]     # amplify to sigma_max variance
-    for i, (t_cur, t_next) in enumerate(zip(t_steps[:-1], t_steps[1:])): # 0, ..., N-1
-        
-        # Increase noise temporarily.
-        gamma = min(S_churn / num_steps, np.sqrt(2) - 1) if S_min <= t_cur <= S_max else 0
-        t_hat = net.round_sigma(t_cur + gamma * t_cur)
-        # sample Brownian motion
-        noise = randn_like(x_cur, t_hat-t_cur)
-        dd_beta, d_beta = noise[1], noise[0]
+    x_next = latents.to(torch.float64) * sigmas[0]     # amplify to sigma_max variance
+    for i, (sigma_cur, sigma_next) in enumerate(zip(sigmas[:-1], sigmas[1:])): # 0, ..., N-1
+        x_cur = x_next
 
         # Euler step.
-        denoised = net(x_cur, t_cur, class_labels).to(torch.float64)
-        d_cur = (x_cur - denoised) * (3*t_cur+t_next) /2 /t_cur**2      # f
-        # x_next = x_cur + (t_next-t_cur)*d_cur +(t_next+t_cur).sqrt()*d_beta
-        x_next = x_cur + (t_next-t_cur)*d_cur +d_beta
+        denoised = net(x_cur, sigma_cur, class_labels).to(torch.float64)
+        f_cur = (x_cur - denoised) / sigma_cur
 
-        # Apply 2nd order correction.
-        if i > 0:
-            _, Jf=jvp(net, (x_cur, t_cur, class_labels), (d_cur,torch.zeros_like(t_cur),torch.zeros_like(class_labels)))
-            _, JL=jvp(net, (x_cur, t_cur, class_labels), (dd_beta,torch.zeros_like(t_cur),torch.zeros_like(class_labels)))
+        if i==num_steps-1 : dt = (sigma_next**(1/rho) - sigma_cur**(1/rho))/B      # positive dt
+        dsigma = B*rho*(sigma_cur.pow((rho-1)/rho))
+        ddsigma = rho*(rho-1)*B*B*(sigma_cur.pow((rho-2)/rho))
+        g_cur = ddsigma*sigma_cur
+        gamma = dsigma + 0.5*dt*ddsigma     
+        x_next = x_cur + f_cur*gamma*dt
 
-            ########## JVP test ##########
-            # x_next.requires_grad_()
-            # output = net(x_next, t_next, class_labels).to(JacoVP.dtype)
-            # res = torch.zeros_like(x_next, dtype=JacoVP.dtype)
-            # for i in range(3):
-            #     for j in range(32):
-            #         for k in range(32):
-            #             output[0][i][j][k].backward(retain_graph=True)
-            #             res[0][i][j][k]=((x_next.grad)*d_cur).sum()
-            #             x_next.grad.zero_()
-            # print(torch.allclose(res.to(torch.float32), JacoVP.to(torch.float32)))
-            # print(torch.pow(res.to(torch.float32)-JacoVP.to(torch.float32), 2).sum())
-            # sys.exit()
-            ###############################
+        k=6         # hyper-param, range=[1,], optimal=6
+        if randn_like.__name__ == 'multiGaussian_like':
+            noise = randn_like(x_cur, dt)
+            # with fwAD.dual_level():
+            #     dual_cur = fwAD.make_dual(x_cur, correlated_noise[1])
+            #     dual_out = net(dual_cur, t_cur, class_labels)
+            #     Jl = fwAD.unpack_dual(dual_out).tangent
+            # x_next = x_next + (dt.pow((1+k)/2))*g_cur.sqrt() * (noise[0])
+        else:
+            # # beta * g(t) = (dt)^0.5 * (sigma^2_t)'^0.5
+            noise = [randn_like(x_cur)]
+            # x_next = x_next + (dt.pow((2+k)/2))*g_cur.sqrt() * randn_like(x_cur)
+            # x_hat = x_cur + (t_hat ** 2 - t_cur ** 2).sqrt() * S_noise*randn_like(x_cur)
+        x_next = x_next + (dt.pow((1+k)/2))*g_cur.sqrt() * (noise[0])
 
-            Jf = ((d_cur-Jf) * (3*t_cur+t_next) /2 /t_cur**2).to(torch.float64)
-            JL = ((torch.stack([torch.eye(x_cur.shape[-1], device=x_cur.device)]*3)-JL) * ((t_next+t_cur)**0.5) * (3*t_cur+t_next)/2/t_cur**2).to(torch.float64)
-            x_next = x_cur + (t_next-t_cur) * ((0.5*d_last + 0.5*d_cur) + (t_next-t_cur) * (Jf)) + d_beta+JL
-        d_last = d_cur
+        # # Apply 2nd order correction.
+        if sigma_cur >= S_max:
+            # denoised = net(x_next, sigma_next, class_labels).to(torch.float64)
+            # # gamma_next = (B*rho*(sigma_next**((rho-1)/rho)) + 0.5*dt*rho*(rho-1)*B*B*(sigma_next**((rho-2)/rho)))
+            # f_next = (x_next - denoised)/sigma_next
+
+            with fwAD.dual_level():
+                dual_x = fwAD.make_dual(x_cur, 0.5*dt*dt*gamma/sigma_cur*f_cur + 0.5*(dt**((1+k)/2))*g_cur.sqrt()/sigma_cur*noise[0])
+                dual_t = fwAD.make_dual(sigma_cur, 0.5*dt*dt/sigma_cur)
+                dual_out = net(dual_x, dual_t, class_labels)
+                JF = fwAD.unpack_dual(dual_out).tangent
+            JF = (0.5*dt*dt*(2*gamma-dsigma)/sigma_cur*f_cur + (dt**((1+k)/2))*g_cur.sqrt()/sigma_cur*noise[0]-JF).to(torch.float64)    # 0.5*dt^2 * (x_next-x_cur)
+            # print((f_next-f_cur-JF*2/dt).pow(2).sum().sqrt())           # Jf*2/dt = d(gamma_cur*f(x_next, t_cur) - gamma_cur*f(x_cur, t_cur))
+            # x_next = x_cur + 0.5*(f_cur*gamma+f_next*gamma)*dt
+            x_next = x_next + JF*gamma
 
     return x_next
 
@@ -493,9 +456,14 @@ def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, device=
         torch.distributed.barrier()
 
     # Load network.
-    dist.print0(f'Loading network from "{network_pkl}"...')
-    with dnnlib.util.open_url(network_pkl, verbose=(dist.get_rank() == 0)) as f:
-        net = pickle.load(f)['ema'].to(device)
+    if network_pkl.startswith('https'):
+        dist.print0(f'Loading network from url "{network_pkl}"...')
+        with dnnlib.util.open_url(network_pkl, verbose=(dist.get_rank() == 0)) as f:
+            net = pickle.load(f)['ema'].to(device)
+    else:
+        dist.print0(f'Loading network from local directorty "{network_pkl}"...')
+        with open(network_pkl, 'rb') as f:
+            net = pickle.load(f).to(device)
 
     # Other ranks follow.
     if dist.get_rank() == 0:
