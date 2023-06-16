@@ -24,7 +24,7 @@ import torch.autograd.forward_ad as fwAD
 #----------------------------------------------------------------------------
 # Our new 2nd-order sampler. 1000img FID = 41.5904
 
-def edm_sampler_(
+def edm_sampler(
     net, latents, class_labels=None, randn_like=torch.randn_like,
     num_steps=18, sigma_min=0.002, sigma_max=80, rho=7,
     S_churn=0, S_min=0, S_max=float('inf'), S_noise=1, k=0
