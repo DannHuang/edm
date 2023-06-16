@@ -1,13 +1,3 @@
-# Copyright (c) 2022, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-#
-# This work is licensed under a Creative Commons
-# Attribution-NonCommercial-ShareAlike 4.0 International License.
-# You should have received a copy of the license along with this
-# work. If not, see http://creativecommons.org/licenses/by-nc-sa/4.0/
-
-"""Minimal standalone example to reproduce the main results from the paper
-"Elucidating the Design Space of Diffusion-Based Generative Models"."""
-
 import tqdm
 import pickle
 import numpy as np
@@ -20,7 +10,7 @@ import dnnlib
 def generate_image_grid(
     network_pkl, dest_path,
     seed=0, gridw=8, gridh=8, device=torch.device('cuda'),
-    num_steps=18, sigma_min=0.002, sigma_max=80, rho=7,
+    num_steps=18, sigma_min=0.002, sigma_max=80, rho=3,
     S_churn=0, S_min=0, S_max=float('inf'), S_noise=1,
 ):
     batch_size = gridw * gridh
@@ -83,7 +73,7 @@ def main():
     model_root = 'https://nvlabs-fi-cdn.nvidia.com/edm/pretrained'
     generate_image_grid(f'{model_root}/edm-cifar10-32x32-cond-vp.pkl',   'cifar10-32x32.png',  num_steps=18) # FID = 1.79, NFE = 35
     generate_image_grid(f'{model_root}/edm-ffhq-64x64-uncond-vp.pkl',    'ffhq-64x64.png',     num_steps=40) # FID = 2.39, NFE = 79
-    generate_image_grid(f'{model_root}/edm-afhqv2-64x64-uncond-vp.pkl',  'afhqv2-64x64.png',   num_steps=40) # FID = 1.96, NFE = 79
+    # generate_image_grid(f'{model_root}/edm-afhqv2-64x64-uncond-vp.pkl',  'afhqv2-64x64.png',   num_steps=40) # FID = 1.96, NFE = 79
     generate_image_grid(f'{model_root}/edm-imagenet-64x64-cond-adm.pkl', 'imagenet-64x64.png', num_steps=256, S_churn=40, S_min=0.05, S_max=50, S_noise=1.003) # FID = 1.36, NFE = 511
 
 #----------------------------------------------------------------------------

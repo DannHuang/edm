@@ -73,8 +73,7 @@ To generate a batch of images using a given model and sampler, run:
 
 ```.bash
 # Generate 64 images and save them as out/*.png
-python generate.py --outdir=out --seeds=0-63 --batch=64 \
-    --network=https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-cifar10-32x32-cond-vp.pkl
+python generate.py --outdir=imgSamples --network=https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-cifar10-32x32-cond-vp.pkl --seeds=0 --batch=1 --steps=18 --S_churn=80 --S_max=1 --randn_like=db
 ```
 
 Generating a large number of images can be time-consuming; the workload can be distributed across multiple GPUs by launching the above command using `torchrun`:
@@ -92,13 +91,18 @@ The sampler settings can be controlled through command-line options; see [`pytho
 python generate.py --outdir=out --steps=18 \
     --network=https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-cifar10-32x32-cond-vp.pkl
 
+python generate.py --outdir=Sampler1.2.0/cifar10_N40_rho3_2nd --network=ckpts/edm-cifar10-32x32-cond-vp.pkl --batch=500 --seeds=0-49999 --steps=40 --randn_like=ddb --rho=3 --subdirs 
+
 # For FFHQ and AFHQv2 at 64x64, use deterministic sampling with 40 steps (NFE = 79)
 python generate.py --outdir=out --steps=40 \
     --network=https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-ffhq-64x64-uncond-vp.pkl
 
+python generate.py --outdir=Sampler1.2.0/ffhq_N84_rho3_2nd --network=ckpts/edm-ffhq-64x64-uncond-vp.pkl --batch=250 --seeds=0-49999 --steps=84 --randn_like=ddb --rho=3 --subdirs
+
 # For ImageNet at 64x64, use stochastic sampling with 256 steps (NFE = 511)
-python generate.py --outdir=out --steps=256 --S_churn=40 --S_min=0.05 --S_max=50 --S_noise=1.003 \
-    --network=https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-imagenet-64x64-cond-adm.pkl
+python generate.py --outdir=imgSamples --network=https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-imagenet-64x64-cond-adm.pkl --batch=100 --seeds=0 --steps=256 --S_churn=40 --S_min=0.05 --S_max=50 --S_noise=1.003 --randn_like=db --subdirs
+
+python generate.py --outdir=imgSamples --network=ckpts/edm-imagenet-64x64-cond-adm.pkl --batch=100 --seeds=0 --steps=2 --rho=3 --subdirs
 ```
 
 Besides our proposed EDM sampler, `generate.py` can also be used to reproduce the sampler ablations from Section 3 of our paper. For example:
@@ -123,12 +127,12 @@ To compute Fr&eacute;chet inception distance (FID) for a given model and sampler
 
 ```.bash
 # Generate 50000 images and save them as fid-tmp/*/*.png
-torchrun --standalone --nproc_per_node=1 generate.py --outdir=fid-tmp --seeds=0-49999 --subdirs \
-    --network=https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-cifar10-32x32-cond-vp.pkl
+python generate.py --outdir=./Sampler1.2.0/imagenet_N48_rho3_D --network=ckpts/edm-imagenet-64x64-cond-adm.pkl --batch=100 --seeds=0-49999 --steps=48 --randn_like=db --rho=3 --subdirs
 
 # Calculate FID
-torchrun --standalone --nproc_per_node=1 fid.py calc --images=fid-tmp \
-    --ref=https://nvlabs-fi-cdn.nvidia.com/edm/fid-refs/cifar10-32x32.npz
+python fid.py calc --images=imgSamples/000000 --ref=https://nvlabs-fi-cdn.nvidia.com/edm/fid-refs/imagenet-64x64.npz --num=1000
+python fid.py calc --images=Sampler1.2.0/cifar10_N40_rho3_2nd --ref=https://nvlabs-fi-cdn.nvidia.com/edm/fid-refs/cifar10-32x32.npz
+python fid.py calc --images=Sampler1.2.0/ffhq_N84_rho3_2nd --ref=https://nvlabs-fi-cdn.nvidia.com/edm/fid-refs/ffhq-64x64.npz
 ```
 
 Both of the above commands can be parallelized across multiple GPUs by adjusting `--nproc_per_node`. The second command typically takes 1-3 minutes in practice, but the first one can sometimes take several hours, depending on the configuration. See [`python fid.py --help`](./docs/fid-help.txt) for the full list of options.

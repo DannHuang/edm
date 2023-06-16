@@ -105,13 +105,15 @@ def main(**kwargs):
         dataset_obj = dnnlib.util.construct_class_by_name(**c.dataset_kwargs)
         dataset_name = dataset_obj.name
         c.dataset_kwargs.resolution = dataset_obj.resolution # be explicit about dataset resolution
+        print(f'res={dataset_obj.resolution}, num_channels={dataset_obj.num_channels}, label dim={dataset_obj.label_dim}')
         c.dataset_kwargs.max_size = len(dataset_obj) # be explicit about dataset size
         if opts.cond and not dataset_obj.has_labels:
             raise click.ClickException('--cond=True requires labels specified in dataset.json')
         del dataset_obj # conserve memory
     except IOError as err:
         raise click.ClickException(f'--data: {err}')
-
+    exit()
+    
     # Network architecture.
     if opts.arch == 'ddpmpp':
         c.network_kwargs.update(model_type='SongUNet', embedding_type='positional', encoder_type='standard', decoder_type='standard')
@@ -131,7 +133,7 @@ def main(**kwargs):
         c.network_kwargs.class_name = 'training.networks.VEPrecond'
         c.loss_kwargs.class_name = 'training.loss.VELoss'
     else:
-        assert opts.precond == 'edm'
+        assert opts.precond == 'edm'    # DEFUALT
         c.network_kwargs.class_name = 'training.networks.EDMPrecond'
         c.loss_kwargs.class_name = 'training.loss.EDMLoss'
 
