@@ -7,9 +7,9 @@ import click
 import torch.autograd.forward_ad as fwAD
 
 '''
-python recompileNN.py --pkl_dir=https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-cifar10-32x32-cond-vp.pkl --arch=ddpmpp
-python recompileNN.py --pkl_dir=https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-imagenet-64x64-cond-adm.pkl --arch=adm
-python recompileNN.py --pkl_dir=https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-ffhq-64x64-uncond-vp.pkl --arch=ddpmpp --cres=1,2,2,2 --dropout=0.05 --augment=0.15
+python recompileNN.py --pkl_dir=https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-cifar10-32x32-cond-vp.pkl
+python recompileNN.py --pkl_dir=https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-imagenet-64x64-cond-adm.pkl
+python recompileNN.py --pkl_dir=https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-ffhq-64x64-uncond-vp.pkl
 '''
 
 def parse_int_list(s):
@@ -45,16 +45,19 @@ def main(**kwargs):
         num_channels=3
         label_dim=10
         model_dir = 'ckpts/edm-cifar10-32x32-cond-vp.pkl'
+        arc = 'ddpmpp'
     if args.pkl_dir == 'https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-imagenet-64x64-cond-adm.pkl':
         res=64
         num_channels=3
         label_dim=1000
         model_dir = 'ckpts/edm-imagenet-64x64-cond-adm.pkl'
+        arc='adm'
     if args.pkl_dir =='https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-ffhq-64x64-uncond-vp.pkl':
         res=64
         num_channels=3
         label_dim=0
         model_dir = 'ckpts/edm-ffhq-64x64-uncond-vp.pkl'
+        arc='ddpmpp'
 
     if args.arch == 'ddpmpp':
         network_kwargs.update(model_type='SongUNet', embedding_type='positional', encoder_type='standard', decoder_type='standard')

@@ -4,22 +4,42 @@ import numpy as np
 import torch
 import PIL.Image
 import dnnlib
+import torch.autograd.forward_ad as fwAD
 
 #----------------------------------------------------------------------------
+def multiGaussian_like(input_tensor, d_t, **kwargs):
+    '''
+    return d_beta and 2nd-order d_beta
+    '''
+    size = input_tensor.shape
+    device = input_tensor.device
+    # Cholesky decomposition of covariance matrix
+    up_left = ((1/3)*d_t**3)**0.5
+    bottom_left = 0.5*(3*d_t)**0.5
+    bottom_right = 0.5*d_t**0.5
+    # up_right = torch.zeros_like(up_left)
+    # left = torch.concat((up_left, bottom_left) , dim=0)
+    # right = torch.concat((up_right, bottom_right) , dim=0)
+    # mean = torch.concat((left, right), dim=1)
+    eps = torch.randn([2, size[1], size[2], size[3]], **kwargs, device=device)
+    dd_beta = eps[0]*up_left
+    d_beta = eps[0]*bottom_left + eps[1]*bottom_right
+    return (d_beta, dd_beta)
+
 
 def generate_image_grid(
     network_pkl, dest_path,
     seed=0, gridw=8, gridh=8, device=torch.device('cuda'),
     num_steps=18, sigma_min=0.002, sigma_max=80, rho=3,
-    S_churn=0, S_min=0, S_max=float('inf'), S_noise=1,
+    S_churn=0, S_min=0, S_max=50.0, S_noise=1,
 ):
     batch_size = gridw * gridh
     torch.manual_seed(seed)
 
     # Load network.
     print(f'Loading network from "{network_pkl}"...')
-    with dnnlib.util.open_url(network_pkl) as f:
-        net = pickle.load(f)['ema'].to(device)
+    with open(network_pkl, 'rb') as f:
+        net = pickle.load(f).to(device)
 
     # Pick latents and labels.
     print(f'Generating {batch_size} images...')
@@ -31,32 +51,49 @@ def generate_image_grid(
     # Adjust noise levels based on what's supported by the network.
     sigma_min = max(sigma_min, net.sigma_min)
     sigma_max = min(sigma_max, net.sigma_max)
+    A = torch.tensor(sigma_max**(1/rho), dtype=torch.float64)
+    B = torch.tensor(sigma_min**(1/rho) - sigma_max**(1/rho), dtype=torch.float64)
 
-    # Time step discretization.
-    step_indices = torch.arange(num_steps, dtype=torch.float64, device=device)
-    t_steps = (sigma_max ** (1 / rho) + step_indices / (num_steps - 1) * (sigma_min ** (1 / rho) - sigma_max ** (1 / rho))) ** rho
-    t_steps = torch.cat([net.round_sigma(t_steps), torch.zeros_like(t_steps[:1])]) # t_N = 0
+    # # Time step discretization, turn time-steps into sigma-schedule.
+    step_indices = torch.arange(num_steps, dtype=torch.float64, device=latents.device)  # [0,1,...,num_steps-1]
+    sigmas = (A + step_indices/(num_steps-1)*B).pow(rho)
+    sigmas = torch.cat([net.round_sigma(sigmas), torch.zeros_like(sigmas[:1])]) # t_steps[num_steps] = 0
+    dt = torch.tensor(1/(num_steps-1), dtype=torch.float64, device=latents.device)
 
-    # Main sampling loop.
-    x_next = latents.to(torch.float64) * t_steps[0]
-    for i, (t_cur, t_next) in tqdm.tqdm(list(enumerate(zip(t_steps[:-1], t_steps[1:]))), unit='step'): # 0, ..., N-1
+    x_next = latents.to(torch.float64) * sigmas[0]     # amplify to sigma_max variance
+    for i, (sigma_cur, sigma_next) in enumerate(zip(sigmas[:-1], sigmas[1:])): # 0, ..., N-1
         x_cur = x_next
+        dt = (sigma_next**(1/rho) - sigma_cur**(1/rho))/B      # dt>0
 
-        # Increase noise temporarily.
-        gamma = min(S_churn / num_steps, np.sqrt(2) - 1) if S_min <= t_cur <= S_max else 0
-        t_hat = net.round_sigma(t_cur + gamma * t_cur)
-        x_hat = x_cur + (t_hat ** 2 - t_cur ** 2).sqrt() * S_noise * torch.randn_like(x_cur)
+        # # increase nosie level except last iteration
+        if i<num_steps-1:
+            diffusion_coff = dt**((rho)/2)*((-B)**(rho)*sigma_cur).sqrt()
+            noise = multiGaussian_like(x_cur, dt)
+            x_cur = x_cur + diffusion_coff * noise[0]
+            sigma_cur = (sigma_cur**2 + dt*diffusion_coff**2).sqrt()
+            dt = (sigma_next**(1/rho) - sigma_cur**(1/rho))/B
 
-        # Euler step.
-        denoised = net(x_hat, t_hat, class_labels).to(torch.float64)
-        d_cur = (x_hat - denoised) / t_hat
-        x_next = x_hat + (t_next - t_hat) * d_cur
+        gamma=torch.tensor(0.0, dtype=torch.float64, device=latents.device)
+        prod=torch.tensor(1.0, dtype=torch.float64, device=latents.device)
+        for j in range(1, int(rho)+1):
+            prod *= (B*(rho-j+1)/j)
+            gamma += dt**(j-1)*prod*sigma_cur**((rho-j)/rho)
 
-        # Apply 2nd order correction.
-        if i < num_steps - 1:
-            denoised = net(x_next, t_next, class_labels).to(torch.float64)
-            d_prime = (x_next - denoised) / t_next
-            x_next = x_hat + (t_next - t_hat) * (0.5 * d_cur + 0.5 * d_prime)
+        # # 2nd order sampling.
+        if i > 0 and sigma_cur >= S_max:
+            with fwAD.dual_level():
+                dual_x = fwAD.make_dual(x_cur, 0.5*dt*dt*gamma/sigma_cur*f_cur+noise[1]/sigma_cur)
+                dual_t = fwAD.make_dual(sigma_cur, 0.5*dt*dt/sigma_cur)
+                dual_out = net(dual_x, dual_t, class_labels)
+                denoised, jfp = fwAD.unpack_dual(dual_out)
+            jfp = (dt*dt*gamma/sigma_cur*f_cur + 0.5*dt*dt/sigma_cur*diffusion_coff*noise[0] + noise[1]/sigma_cur -jfp).to(torch.float64)    # 0.5*dt^2 * (x_next-x_cur)
+            f_cur = (x_cur - denoised) / sigma_cur
+            x_next = x_cur + (f_cur*dt + jfp)*gamma
+        else:
+            # # Euler step.
+            denoised = net(x_cur, sigma_cur, class_labels).to(torch.float64)
+            f_cur = (x_cur - denoised) / sigma_cur  
+            x_next = x_next + f_cur*gamma*dt
 
     # Save image grid.
     print(f'Saving image grid to "{dest_path}"...')
@@ -70,11 +107,10 @@ def generate_image_grid(
 #----------------------------------------------------------------------------
 
 def main():
-    model_root = 'https://nvlabs-fi-cdn.nvidia.com/edm/pretrained'
-    generate_image_grid(f'{model_root}/edm-cifar10-32x32-cond-vp.pkl',   'cifar10-32x32.png',  num_steps=18) # FID = 1.79, NFE = 35
-    generate_image_grid(f'{model_root}/edm-ffhq-64x64-uncond-vp.pkl',    'ffhq-64x64.png',     num_steps=40) # FID = 2.39, NFE = 79
-    # generate_image_grid(f'{model_root}/edm-afhqv2-64x64-uncond-vp.pkl',  'afhqv2-64x64.png',   num_steps=40) # FID = 1.96, NFE = 79
-    generate_image_grid(f'{model_root}/edm-imagenet-64x64-cond-adm.pkl', 'imagenet-64x64.png', num_steps=256, S_churn=40, S_min=0.05, S_max=50, S_noise=1.003) # FID = 1.36, NFE = 511
+    model_root = 'ckpts'
+    generate_image_grid(f'{model_root}/edm-cifar10-32x32-cond-vp.pkl',   'cifar10-32x32.png',  num_steps=84)
+    generate_image_grid(f'{model_root}/edm-ffhq-64x64-uncond-vp.pkl',    'ffhq-64x64.png',     num_steps=84)
+    generate_image_grid(f'{model_root}/edm-imagenet-64x64-cond-adm.pkl', 'imagenet-64x64.png', num_steps=84)
 
 #----------------------------------------------------------------------------
 

@@ -360,14 +360,9 @@ def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, device=
         torch.distributed.barrier()
 
     # Load network.
-    if network_pkl.startswith('https'):
-        dist.print0(f'Loading network from url "{network_pkl}"...')
-        with dnnlib.util.open_url(network_pkl, verbose=(dist.get_rank() == 0)) as f:
-            net = pickle.load(f)['ema'].to(device)
-    else:
-        dist.print0(f'Loading network from local directorty "{network_pkl}"...')
-        with open(network_pkl, 'rb') as f:
-            net = pickle.load(f).to(device)
+    dist.print0(f'Loading network from local directorty "{network_pkl}"...')
+    with open(network_pkl, 'rb') as f:
+        net = pickle.load(f).to(device)
 
     # Other ranks follow.
     if dist.get_rank() == 0:
