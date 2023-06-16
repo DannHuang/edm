@@ -1,0 +1,15 @@
+/imgSamples
+
+/Sampler1.2.0
+
+/ckpts
+
+*.pyc
+
+*.pkl
+
+draft.py
+
+script.py
+
+*.png

@@ -1,26 +1,15 @@
-## Elucidating the Design Space of Diffusion-Based Generative Models (EDM)<br><sub>Official PyTorch implementation of the NeurIPS 2022 paper</sub>
+## 2nd-SED Solver for Diffusion Model</sub>
 
-![Teaser image](./docs/teaser-1920x640.jpg)
+Abstract: *Diffusion Probabilistic Model (DPM) has achieved remarkable advancement in the area of Image Synthesis. DPM is defined on a forward process where small amount of noise is progressively added to image until the signal is destroyed. A Neural-Network is trained to denoise a white noise back to a real data sample by minimizing the variational Lower-Bound (VLB) of negative log-likelihood, which is called the reverse process. By extending the diffusion length to infinity, both forward and reverse processes can be generalized to Stochastic Differential Equations (SDEs), and these two processes are then integration of the corresponding SDE along time dimension. Current DPM samplers turn out to be some first-order SDE solvers. In this project, we expand the SDE to include higher order terms using It\^o-Taylor expansion, and examine the performance of a second-order SDE solver implemented using forward-mode auto-differentiation in PyTorch.*
 
-**Elucidating the Design Space of Diffusion-Based Generative Models**<br>
-Tero Karras, Miika Aittala, Timo Aila, Samuli Laine
-<br>https://arxiv.org/abs/2206.00364<br>
+## Environments
 
-Abstract: *We argue that the theory and practice of diffusion-based generative models are currently unnecessarily convoluted and seek to remedy the situation by presenting a design space that clearly separates the concrete design choices. This lets us identify several changes to both the sampling and training processes, as well as preconditioning of the score networks. Together, our improvements yield new state-of-the-art FID of 1.79 for CIFAR-10 in a class-conditional setting and 1.97 in an unconditional setting, with much faster sampling (35 network evaluations per image) than prior designs. To further demonstrate their modular nature, we show that our design changes dramatically improve both the efficiency and quality obtainable with pre-trained score networks from previous work, including improving the FID of a previously trained ImageNet-64 model from 2.07 to near-SOTA 1.55, and after re-training with our proposed improvements to a new SOTA of 1.36.*
-
-For business inquiries, please visit our website and submit the form: [NVIDIA Research Licensing](https://www.nvidia.com/en-us/research/inquiries/)
-
-## Requirements
-
-* Linux and Windows are supported, but we recommend Linux for performance and compatibility reasons.
-* 1+ high-end NVIDIA GPU for sampling and 8+ GPUs for training. We have done all testing and development using V100 and A100 GPUs.
-* 64-bit Python 3.8 and PyTorch 1.12.0 (or later). See https://pytorch.org for PyTorch install instructions.
-* Python libraries: See [environment.yml](./environment.yml) for exact library dependencies. You can use the following commands with Miniconda3 to create and activate your Python environment:
-  - `conda env create -f environment.yml -n edm`
-  - `conda activate edm`
-* Docker users:
-  - Ensure you have correctly installed the [NVIDIA container runtime](https://docs.docker.com/config/containers/resource_constraints/#gpu).
-  - Use the [provided Dockerfile](./Dockerfile) to build an image with the required library dependencies.
+* Linux and Windows are supported, but the program was implemented solely on Linux so we recommand running on Linux to avoid any unexpected problems.
+* 1 high-end NVIDIA GPU can reproduce the result. We have done all testing and development on 4070Ti.
+* 64-bit Python 3.8 and PyTorch 2.0.1 (or later). See https://pytorch.org for PyTorch install instructions.
+* Python libraries: See [environment.yml](./environment.yml) for exact library dependencies. You can use the following commands with Anaconda3/Miniconda3 to create and activate your Python environment:
+  - `conda env create -f environment.yml -n 2nd_DMSDE`
+  - `conda activate 2nd_DMSDE`
 
 ## Getting started
 
@@ -41,30 +30,13 @@ This is a minimal standalone script that loads the best pre-trained model for ea
 
 The easiest way to explore different sampling strategies is to modify [`example.py`](./example.py) directly. You can also incorporate the pre-trained models and/or our proposed EDM sampler in your own code by simply copy-pasting the relevant bits. Note that the class definitions for the pre-trained models are stored within the pickles themselves and loaded automatically during unpickling via [`torch_utils.persistence`](./torch_utils/persistence.py). To use the models in external Python scripts, just make sure that `torch_utils` and `dnnlib` are accesible through `PYTHONPATH`.
 
-**Docker**: You can run the example script using Docker as follows:
-
-```.bash
-# Build the edm:latest image
-docker build --tag edm:latest .
-
-# Run the generate.py script using Docker:
-docker run --gpus all -it --rm --user $(id -u):$(id -g) \
-    -v `pwd`:/scratch --workdir /scratch -e HOME=/scratch \
-    edm:latest \
-    python example.py
-```
-
-Note: The Docker image requires NVIDIA driver release `r520` or later.
-
-The `docker run` invocation may look daunting, so let's unpack its contents here:
-
-- `--gpus all -it --rm --user $(id -u):$(id -g)`: with all GPUs enabled, run an interactive session with current user's UID/GID to avoid Docker writing files as root.
-- ``-v `pwd`:/scratch --workdir /scratch``: mount current running dir (e.g., the top of this git repo on your host machine) to `/scratch` in the container and use that as the current working dir.
-- `-e HOME=/scratch`: specify where to cache temporary files. Note: if you want more fine-grained control, you can instead set `DNNLIB_CACHE_DIR` (for pre-trained model download cache). You want these cache dirs to reside on persistent volumes so that their contents are retained across multiple `docker run` invocations.
-
 ## Pre-trained models
 
 We provide pre-trained models for our proposed training configuration (config F) as well as the baseline configuration (config A):
+
+**Elucidating the Design Space of Diffusion-Based Generative Models**<br>
+Tero Karras, Miika Aittala, Timo Aila, Samuli Laine
+<br>https://arxiv.org/abs/2206.00364<br>
 
 - [https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/](https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/)
 - [https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/baseline/](https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/baseline/)
@@ -73,8 +45,7 @@ To generate a batch of images using a given model and sampler, run:
 
 ```.bash
 # Generate 64 images and save them as out/*.png
-python generate.py --outdir=out --seeds=0-63 --batch=64 \
-    --network=https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-cifar10-32x32-cond-vp.pkl
+python generate.py --outdir=imgSamples --network=https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-cifar10-32x32-cond-vp.pkl --seeds=0 --batch=1 --steps=18 --S_churn=80 --S_max=1 --randn_like=db
 ```
 
 Generating a large number of images can be time-consuming; the workload can be distributed across multiple GPUs by launching the above command using `torchrun`:
@@ -92,13 +63,18 @@ The sampler settings can be controlled through command-line options; see [`pytho
 python generate.py --outdir=out --steps=18 \
     --network=https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-cifar10-32x32-cond-vp.pkl
 
+python generate.py --outdir=Sampler1.2.0/cifar10_N40_rho3_2nd --network=ckpts/edm-cifar10-32x32-cond-vp.pkl --batch=500 --seeds=0-49999 --steps=40 --randn_like=ddb --rho=3 --subdirs 
+
 # For FFHQ and AFHQv2 at 64x64, use deterministic sampling with 40 steps (NFE = 79)
 python generate.py --outdir=out --steps=40 \
     --network=https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-ffhq-64x64-uncond-vp.pkl
 
+python generate.py --outdir=Sampler1.2.0/ffhq_N84_rho3_2nd --network=ckpts/edm-ffhq-64x64-uncond-vp.pkl --batch=250 --seeds=0-49999 --steps=84 --randn_like=ddb --rho=3 --subdirs
+
 # For ImageNet at 64x64, use stochastic sampling with 256 steps (NFE = 511)
-python generate.py --outdir=out --steps=256 --S_churn=40 --S_min=0.05 --S_max=50 --S_noise=1.003 \
-    --network=https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-imagenet-64x64-cond-adm.pkl
+python generate.py --outdir=imgSamples --network=https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-imagenet-64x64-cond-adm.pkl --batch=2 --seeds=0-1 --steps=256 --S_churn=40 --S_min=0.05 --S_max=50 --S_noise=1.003 --subdirs --class=164
+
+python generate.py --outdir=imgSamples --network=ckpts/edm-imagenet-64x64-cond-adm.pkl --batch=100 --seeds=0 --steps=2 --rho=3 --subdirs 
 ```
 
 Besides our proposed EDM sampler, `generate.py` can also be used to reproduce the sampler ablations from Section 3 of our paper. For example:
@@ -123,12 +99,12 @@ To compute Fr&eacute;chet inception distance (FID) for a given model and sampler
 
 ```.bash
 # Generate 50000 images and save them as fid-tmp/*/*.png
-torchrun --standalone --nproc_per_node=1 generate.py --outdir=fid-tmp --seeds=0-49999 --subdirs \
-    --network=https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-cifar10-32x32-cond-vp.pkl
+python generate.py --outdir=./Sampler1.2.0/imagenet_N48_rho3_D --network=ckpts/edm-imagenet-64x64-cond-adm.pkl --batch=100 --seeds=0-49999 --steps=48 --randn_like=db --rho=3 --subdirs
 
 # Calculate FID
-torchrun --standalone --nproc_per_node=1 fid.py calc --images=fid-tmp \
-    --ref=https://nvlabs-fi-cdn.nvidia.com/edm/fid-refs/cifar10-32x32.npz
+python fid.py calc --images=imgSamples/000000 --ref=https://nvlabs-fi-cdn.nvidia.com/edm/fid-refs/imagenet-64x64.npz --num=1000
+python fid.py calc --images=Sampler1.2.0/cifar10_N40_rho3_2nd --ref=https://nvlabs-fi-cdn.nvidia.com/edm/fid-refs/cifar10-32x32.npz
+python fid.py calc --images=Sampler1.2.0/ffhq_N84_rho3_2nd --ref=https://nvlabs-fi-cdn.nvidia.com/edm/fid-refs/ffhq-64x64.npz
 ```
 
 Both of the above commands can be parallelized across multiple GPUs by adjusting `--nproc_per_node`. The second command typically takes 1-3 minutes in practice, but the first one can sometimes take several hours, depending on the configuration. See [`python fid.py --help`](./docs/fid-help.txt) for the full list of options.
