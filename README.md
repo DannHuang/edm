@@ -56,7 +56,7 @@ python generate.py --outdir=Sampler1.2.0/cifar10_N40_rho3_2nd --network=ckpts/ed
 python generate.py --outdir=Sampler1.2.0/ffhq_N84_rho3_2nd --network=ckpts/edm-ffhq-64x64-uncond-vp.pkl --batch=250 --seeds=0-99 --steps=84 --randn_like=ddb --rho=3 --subdirs
 
 # For ImageNet at 64x64, use stochastic sampling with 84 steps
-python generate.py --outdir=imgSamples --network=ckpts/edm-imagenet-64x64-cond-adm.pkl --batch=100 --seeds=0-99 --steps=84 --randn_like=ddb --rho=3 --subdirs 
+python generate.py --outdir=imgSamples --network=ckpts/edm-imagenet-64x64-cond-adm.pkl --batch=100 --seeds=0-9 --steps=84 --randn_like=ddb --rho=3 --subdirs
 ```
 
 ## Calculating FID
@@ -68,7 +68,7 @@ To compute Fr&eacute;chet inception distance (FID) for a given model and sampler
 python generate.py --outdir=imagenet --network=ckpts/edm-imagenet-64x64-cond-adm.pkl --batch=100 --seeds=0-49999 --steps=84 --randn_like=ddb --rho=3 --subdirs
 
 # Calculate FID
-python fid.py calc --images=imagenet --ref=https://nvlabs-fi-cdn.nvidia.com/edm/fid-refs/imagenet-64x64.npz
+python fid.py calc --images=imgSamples --ref=https://nvlabs-fi-cdn.nvidia.com/edm/fid-refs/imagenet-64x64.npz --num=1000
 ```
 
 Note that the numerical value of FID varies across different random seeds and is highly sensitive to the number of images. By default, `fid.py` will always use 50,000 generated images; providing fewer images will result in an error, whereas providing more will use a random subset. To reduce the effect of random variation, we recommend repeating the calculation multiple times with different seeds, e.g., `--seeds=0-49999`, `--seeds=50000-99999`, and `--seeds=100000-149999`. In our paper, we calculated each FID three times and reported the minimum.

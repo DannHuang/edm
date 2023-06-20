@@ -31,7 +31,7 @@ def generate_image_grid(
     network_pkl, dest_path,
     seed=0, gridw=8, gridh=8, device=torch.device('cuda'),
     num_steps=18, sigma_min=0.002, sigma_max=80, rho=3,
-    S_churn=0, S_min=0, S_max=50.0, S_noise=1,
+    S_churn=0, S_min=0, S_max=float('inf'), S_noise=1,
 ):
     batch_size = gridw * gridh
     torch.manual_seed(seed)
@@ -58,16 +58,16 @@ def generate_image_grid(
     step_indices = torch.arange(num_steps, dtype=torch.float64, device=latents.device)  # [0,1,...,num_steps-1]
     sigmas = (A + step_indices/(num_steps-1)*B).pow(rho)
     sigmas = torch.cat([net.round_sigma(sigmas), torch.zeros_like(sigmas[:1])]) # t_steps[num_steps] = 0
-    dt = torch.tensor(1/(num_steps-1), dtype=torch.float64, device=latents.device)
+    dt_org = torch.tensor(1/(num_steps-1), dtype=torch.float64, device=latents.device)
 
     x_next = latents.to(torch.float64) * sigmas[0]     # amplify to sigma_max variance
     for i, (sigma_cur, sigma_next) in enumerate(zip(sigmas[:-1], sigmas[1:])): # 0, ..., N-1
         x_cur = x_next
-        dt = (sigma_next**(1/rho) - sigma_cur**(1/rho))/B      # dt>0
+        dt = dt_org
 
         # # increase nosie level except last iteration
         if i<num_steps-1:
-            diffusion_coff = dt**((rho)/2)*((-B)**(rho)*sigma_cur).sqrt()
+            diffusion_coff = dt**((rho-1)/2)*((-B)**(rho)).sqrt()
             noise = multiGaussian_like(x_cur, dt)
             x_cur = x_cur + diffusion_coff * noise[0]
             sigma_cur = (sigma_cur**2 + dt*diffusion_coff**2).sqrt()
@@ -75,14 +75,14 @@ def generate_image_grid(
 
         gamma=torch.tensor(0.0, dtype=torch.float64, device=latents.device)
         prod=torch.tensor(1.0, dtype=torch.float64, device=latents.device)
-        for j in range(1, int(rho)+1):
+        for j in range(1, int(rho)):
             prod *= (B*(rho-j+1)/j)
             gamma += dt**(j-1)*prod*sigma_cur**((rho-j)/rho)
 
         # # 2nd order sampling.
         if i > 0 and sigma_cur >= S_max:
             with fwAD.dual_level():
-                dual_x = fwAD.make_dual(x_cur, 0.5*dt*dt*gamma/sigma_cur*f_cur+noise[1]/sigma_cur)
+                dual_x = fwAD.make_dual(x_cur, 0.5*dt*dt*gamma/sigma_cur*f_cur+diffusion_coff*noise[1]/sigma_cur)
                 dual_t = fwAD.make_dual(sigma_cur, 0.5*dt*dt/sigma_cur)
                 dual_out = net(dual_x, dual_t, class_labels)
                 denoised, jfp = fwAD.unpack_dual(dual_out)
@@ -95,8 +95,7 @@ def generate_image_grid(
             f_cur = (x_cur - denoised) / sigma_cur  
             x_next = x_next + f_cur*gamma*dt
 
-    # Save image grid.
-    print(f'Saving image grid to "{dest_path}"...')
+    # # Save image grid.
     image = (x_next * 127.5 + 128).clip(0, 255).to(torch.uint8)
     image = image.reshape(gridh, gridw, *image.shape[1:]).permute(0, 3, 1, 4, 2)
     image = image.reshape(gridh * net.img_resolution, gridw * net.img_resolution, net.img_channels)

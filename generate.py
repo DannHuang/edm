@@ -40,17 +40,17 @@ def edm_sampler(
     step_indices = torch.arange(num_steps, dtype=torch.float64, device=latents.device)  # [0,1,...,num_steps-1]
     sigmas = (A + step_indices/(num_steps-1)*B).pow(rho)
     sigmas = torch.cat([net.round_sigma(sigmas), torch.zeros_like(sigmas[:1])]) # t_steps[num_steps] = 0
-    dt = torch.tensor(1/(num_steps-1), dtype=torch.float64, device=latents.device)
+    dt_org = torch.tensor(1/(num_steps-1), dtype=torch.float64, device=latents.device)
 
     # # Main sampling loop.
     x_next = latents.to(torch.float64) * sigmas[0]     # amplify to sigma_max variance
     for i, (sigma_cur, sigma_next) in enumerate(zip(sigmas[:-1], sigmas[1:])): # 0, ..., N-1
         x_cur = x_next
-        dt = (sigma_next**(1/rho) - sigma_cur**(1/rho))/B      # dt>0
+        dt = dt_org
 
         # # increase nosie level except last iteration
         if i<num_steps-1:
-            diffusion_coff = dt**((rho)/2)*((-B)**(rho)*sigma_cur).sqrt()
+            diffusion_coff = dt**((rho-1)/2)*((-B)**(rho)).sqrt()
             if randn_like.__name__ == 'multiGaussian_like':
                 noise = randn_like(x_cur, dt)
             else:
@@ -91,7 +91,7 @@ def edm_sampler(
         # # backward 2nd order sampling.
         if i > 0 and sigma_cur >= S_max:
             with fwAD.dual_level():
-                dual_x = fwAD.make_dual(x_cur, 0.5*dt*dt*gamma/sigma_cur*f_cur+noise[1]/sigma_cur)
+                dual_x = fwAD.make_dual(x_cur, 0.5*dt*dt*gamma/sigma_cur*f_cur+diffusion_coff*noise[1]/sigma_cur)
                 dual_t = fwAD.make_dual(sigma_cur, 0.5*dt*dt/sigma_cur)
                 dual_out = net(dual_x, dual_t, class_labels)
                 denoised, jfp = fwAD.unpack_dual(dual_out)
