@@ -74,7 +74,7 @@ python generate.py --outdir=Sampler1.2.0/ffhq_N84_rho3_2nd --network=ckpts/edm-f
 # For ImageNet at 64x64, use stochastic sampling with 256 steps (NFE = 511)
 python generate.py --outdir=imgSamples --network=https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-imagenet-64x64-cond-adm.pkl --batch=2 --seeds=0-1 --steps=256 --S_churn=40 --S_min=0.05 --S_max=50 --S_noise=1.003 --subdirs --class=164
 
-python generate.py --outdir=imgSamples --network=ckpts/edm-imagenet-64x64-cond-adm.pkl --batch=100 --seeds=0 --steps=2 --rho=3 --subdirs 
+python generate.py --outdir=imgSamples --network=https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-imagenet-64x64-cond-adm.pkl --batch=100 --seeds=0 --steps=40 --rho=3 --subdirs  --S_max=20.0
 ```
 
 Besides our proposed EDM sampler, `generate.py` can also be used to reproduce the sampler ablations from Section 3 of our paper. For example:

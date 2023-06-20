@@ -92,7 +92,7 @@ def edm_sampler_(
 # Our new 1st-order sampler.
 
 def edm_sampler(
-    net, latents, class_labels=None, randn_like=torch.randn_like,
+    net, latents, class_labels=None,
     num_steps=18, sigma_min=0.002, sigma_max=80, rho=7,
     S_churn=0, S_min=0, S_max=float('inf'), S_noise=1,
 ):
@@ -105,9 +105,9 @@ def edm_sampler(
     B = sigma_min ** (1 / rho) - sigma_med ** (1 / rho)
 
     # # First linear steps part
-    linear_steps = 2
+    linear_steps = 1
     ode_step_indices = torch.arange(linear_steps, dtype=torch.float64, device=latents.device)
-    ode_sigmas = (sigma_max**(1/rho) + ode_step_indices[:-1]/(linear_steps-1)*(sigma_med**(1/rho)-sigma_max**(1/rho)))**rho
+    ode_sigmas = (sigma_max**(1/rho) + ode_step_indices/(linear_steps)*(sigma_med**(1/rho)-sigma_max**(1/rho)))**rho
     # # Time step discretization, turn time-steps into sigma-schedule
     step_indices = torch.arange(num_steps, dtype=torch.float64, device=latents.device)
     sigmas = (A + step_indices/(num_steps-1)*B) ** rho
@@ -123,14 +123,10 @@ def edm_sampler(
         # diffusion_coff = 2 * dt**((1+rho)/2)*((-B)**(rho)*sigma_cur).sqrt()
         # diffusion_coff = min(S_churn / num_steps, 2**0.5 - 1) if S_min <= sigma_cur <= S_max else 0
         diffusion_coff = 2**0.5-1 if S_min <= sigma_cur <= S_max else 0
-        if randn_like.__name__ == 'multiGaussian_like':
-            noise = randn_like(x_cur, 1/(num_steps-1))
-            # x_next = x_next + (dt**((1+rho)/2))*(rho*(rho-1)*B*B*(sigma_cur**((2*rho-2)/rho))).sqrt() * correlated_noise[0]
-        else:
-            # # v1.0 implementation
-            noise = [randn_like(x_cur)]
-            # # v2.0 implementation
-            # x_next = x_next + (g_square*t_cur).sqrt() * (dt**((1+k)/2))*randn_like(x_cur)
+        # # v1.0 implementation
+        noise = [torch.randn_like(x_cur)]
+        # # v2.0 implementation
+        # x_next = x_next + (g_square*t_cur).sqrt() * (dt**((1+k)/2))*randn_like(x_cur)
         x_next = x_cur + (diffusion_coff**2 + 2*diffusion_coff)**0.5*sigma_cur * noise[0]
 
         # # adjust sigma_cur and dt
@@ -177,6 +173,7 @@ def edm_sampler(
 
     return x_next
 
+'''
 #----------------------------------------------------------------------------
 # Our new 2nd-order sampler. 1000img FID = 41.5904
 
@@ -221,29 +218,6 @@ def edm_sampler_(
             prod *= (B*(rho-j+1)/j)
             gamma += dt**(j-1)*prod*sigma_cur**((rho-j)/rho)
 
-        '''
-        # # Apply 2nd order correction.
-        if i < num_steps - 2 and sigma_cur > S_max:
-            # # Euler step.
-            denoised = net(x_cur, sigma_cur, class_labels).to(torch.float64)
-            f_cur = (x_cur - denoised) / sigma_cur
-            x_next = x_cur + gamma*f_cur*dt
-            # # v1.0 implementation
-            # dsigma = B*rho*(sigma_cur.pow((rho-1)/rho))
-            # ddsigma = rho*(rho-1)*B*B*(sigma_cur.pow((rho-2)/rho))
-            # g_cur = ddsigma*sigma_cur
-            # gamma = dsigma + 0.5*dt*ddsigma     
-            with fwAD.dual_level():
-                dual_x = fwAD.make_dual(x_next, 0.5*dt*dt*gamma/sigma_cur*f_cur)
-                dual_t = fwAD.make_dual(sigma_next, 0.5*dt*dt/sigma_cur)
-                dual_out = net(dual_x, dual_t, class_labels)
-                denoised, jfp = fwAD.unpack_dual(dual_out)
-            jfp = (0.5*dt*dt*gamma/sigma_cur*f_cur + 0.5*dt*dt*gamma/sigma_cur*f_cur -jfp).to(torch.float64)    # 0.5*dt^2 * (x_next-x_cur)
-            # print((f_next-f_cur-JF*2/dt).pow(2).sum().sqrt())           # Jf*2/dt = d(gamma_cur*f(x_next, t_cur) - gamma_cur*f(x_cur, t_cur))
-            # x_next = x_cur + 0.5*(f_cur*gamma+f_next*gamma)*dt``
-            x_next = x_cur + (f_cur*dt + jfp)*gamma
-            '''
-
         # # backward 2nd order sampling.
         if i > 0 and sigma_cur >= S_max:
             with fwAD.dual_level():
@@ -276,6 +250,7 @@ def edm_sampler_(
         #     x_next = x_next + 0.5*(f_prime*gamma-f_cur*gamma)*dt
 
     return x_next
+    '''
 
 #----------------------------------------------------------------------------
 # Generalized ablation sampler, representing the superset of all sampling
@@ -483,7 +458,8 @@ def parse_int_list(s):
 @click.option('--S_max', 'S_max',          help='Stoch. max noise level', metavar='FLOAT',                          type=click.FloatRange(min=0), default='inf', show_default=True)
 @click.option('--S_noise', 'S_noise',      help='Stoch. noise inflation', metavar='FLOAT',                          type=float, default=1, show_default=True)
 # @click.option('--k',                       help='residual order of diffusion-coefficient', metavar='FLOAT',         type=click.FloatRange(min=0, min_open=False), default=0, show_default=True)
-@click.option('--randn_like',              help='Stoch. Brownian motions generator', metavar='db|ddb',              type=click.Choice(['db', 'ddb']), default='db')
+# @click.option('--randn_like',              help='Stoch. Brownian motions generator', metavar='db|ddb',              type=click.Choice(['db', 'ddb']), default='db')
+
 # ablation
 @click.option('--solver',                  help='Ablate ODE solver', metavar='euler|heun',                          type=click.Choice(['euler', 'heun']))
 @click.option('--disc', 'discretization',  help='Ablate time step discretization {t_i}', metavar='vp|ve|iddpm|edm', type=click.Choice(['vp', 've', 'iddpm', 'edm']))
@@ -491,21 +467,7 @@ def parse_int_list(s):
 @click.option('--scaling',                 help='Ablate signal scaling s(t)', metavar='vp|none',                    type=click.Choice(['vp', 'none']))
 
 def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, device=torch.device('cuda'), **sampler_kwargs):
-    """Generate random images using the techniques described in the paper
-    "Elucidating the Design Space of Diffusion-Based Generative Models".
 
-    Examples:
-
-    \b
-    # Generate 64 images and save them as out/*.png
-    python generate.py --outdir=out --seeds=0-63 --batch=64 \\
-        --network=https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-cifar10-32x32-cond-vp.pkl
-
-    \b
-    # Generate 1024 images using 2 GPUs
-    torchrun --standalone --nproc_per_node=2 generate.py --outdir=out --seeds=0-999 --batch=64 \\
-        --network=https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-cifar10-32x32-cond-vp.pkl
-    """
     dist.init()
     num_batches = ((len(seeds) - 1) // (max_batch_size * dist.get_world_size()) + 1) * dist.get_world_size()
     all_batches = torch.as_tensor(seeds).tensor_split(num_batches)
@@ -550,8 +512,8 @@ def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, device=
         # Generate images.
         sampler_kwargs = {key: value for key, value in sampler_kwargs.items() if value is not None}     # unwrap kwargs, withdraw non-stated params
         have_ablation_kwargs = any(x in sampler_kwargs for x in ['solver', 'discretization', 'schedule', 'scaling'])
-        if 'randn_like' in sampler_kwargs and type(sampler_kwargs['randn_like']) is str:
-            sampler_kwargs['randn_like'] = rnd.randn_like if sampler_kwargs['randn_like'] == 'db' else rnd.multiGaussian_like
+        # if 'randn_like' in sampler_kwargs and type(sampler_kwargs['randn_like']) is str:
+        #     sampler_kwargs['randn_like'] = rnd.randn_like if sampler_kwargs['randn_like'] == 'db' else rnd.multiGaussian_like
         sampler_fn = ablation_sampler if have_ablation_kwargs else edm_sampler
         images = sampler_fn(net, latents, class_labels, **sampler_kwargs)
 
