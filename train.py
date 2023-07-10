@@ -112,7 +112,6 @@ def main(**kwargs):
         del dataset_obj # conserve memory
     except IOError as err:
         raise click.ClickException(f'--data: {err}')
-    exit()
     
     # Network architecture.
     if opts.arch == 'ddpmpp':

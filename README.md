@@ -72,25 +72,7 @@ python generate.py --outdir=out --steps=40 \
 python generate.py --outdir=Sampler1.2.0/ffhq_N84_rho3_2nd --network=ckpts/edm-ffhq-64x64-uncond-vp.pkl --batch=250 --seeds=0-49999 --steps=84 --randn_like=ddb --rho=3 --subdirs
 
 # For ImageNet at 64x64, use stochastic sampling with 256 steps (NFE = 511)
-python generate.py --outdir=imgSamples --network=https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-imagenet-64x64-cond-adm.pkl --batch=100 --seeds=0-999 --steps=40 --rho=3 --S_max=15.0 --subdirs
-
-python generate.py --outdir=imgSamples --network=https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-imagenet-64x64-cond-adm.pkl --batch=100 --seeds=0 --steps=40 --rho=3 --subdirs --S_max=1.0 --class=164
-```
-
-Besides our proposed EDM sampler, `generate.py` can also be used to reproduce the sampler ablations from Section 3 of our paper. For example:
-
-```.bash
-# Figure 2a, "Our reimplementation"
-python generate.py --outdir=out --steps=512 --solver=euler --disc=vp --schedule=vp --scaling=vp \
-    --network=https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/baseline/baseline-cifar10-32x32-uncond-vp.pkl
-
-# Figure 2a, "+ Heun & our {t_i}"
-python generate.py --outdir=out --steps=128 --solver=heun --disc=edm --schedule=vp --scaling=vp \
-    --network=https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/baseline/baseline-cifar10-32x32-uncond-vp.pkl
-
-# Figure 2a, "+ Our sigma(t) & s(t)"
-python generate.py --outdir=out --steps=18 --solver=heun --disc=edm --schedule=linear --scaling=none \
-    --network=https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/baseline/baseline-cifar10-32x32-uncond-vp.pkl
+python generate.py --outdir=imgSamples --network=https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-imagenet-64x64-cond-adm.pkl --batch=100 --seeds=0-999 --steps=40 --rho=3 --subdirs --S_max=5.0 --class=164
 ```
 
 ## Calculating FID
@@ -99,10 +81,10 @@ To compute Fr&eacute;chet inception distance (FID) for a given model and sampler
 
 ```.bash
 # Generate 50000 images and save them as fid-tmp/*/*.png
-python generate.py --outdir=./Sampler1.2.0/imagenet_N48_rho3_D --network=ckpts/edm-imagenet-64x64-cond-adm.pkl --batch=100 --seeds=0-49999 --steps=48 --randn_like=db --rho=3 --subdirs
+python generate.py --outdir=imgSamples --network=https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-imagenet-64x64-cond-adm.pkl --batch=100 --seeds=0 --steps=80 --rho=3 --subdirs --S_max=5.0
 
 # Calculate FID
-python fid.py calc --images=imgSamples/000000 --ref=https://nvlabs-fi-cdn.nvidia.com/edm/fid-refs/imagenet-64x64.npz --num=1000
+python fid.py calc --images=imgSamples --ref=https://nvlabs-fi-cdn.nvidia.com/edm/fid-refs/imagenet-64x64.npz --num=1000
 python fid.py calc --images=Sampler1.2.0/cifar10_N40_rho3_2nd --ref=https://nvlabs-fi-cdn.nvidia.com/edm/fid-refs/cifar10-32x32.npz
 python fid.py calc --images=Sampler1.2.0/ffhq_N84_rho3_2nd --ref=https://nvlabs-fi-cdn.nvidia.com/edm/fid-refs/ffhq-64x64.npz
 ```

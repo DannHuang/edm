@@ -24,7 +24,7 @@ import torch.autograd.forward_ad as fwAD
 #----------------------------------------------------------------------------
 # Original EDM sampler (Algorithm 2). 1000img FID=40.4493
 
-def edm_sampler_(
+def edm_sampler(
     net, latents, class_labels=None, randn_like=torch.randn_like,
     num_steps=18, sigma_min=0.002, sigma_max=80, rho=7,
     S_churn=0, S_min=0, S_max=float('inf'), S_noise=1, k=0
@@ -42,134 +42,175 @@ def edm_sampler_(
 
     # # Main sampling loop.
     x_next = latents.to(torch.float64) * t_steps[0]
-    print('[',end='')
     for i, (t_cur, t_next) in enumerate(zip(t_steps[:-1], t_steps[1:])): # 0, ..., N-1
         x_cur = x_next
 
         # # Increase noise temporarily.
         gamma = min(S_churn / num_steps, 2**0.5 - 1) if S_min <= t_cur <= S_max else 0
+        # gamma = 2**0.5 - 1
         t_hat = net.round_sigma(t_cur + gamma * t_cur)  # 2**0.5 * t_cur
-        if randn_like.__name__ == 'multiGaussian_like':
-            correlated_noise = randn_like(x_cur, (t_cur**(1/rho)-t_hat**(1/rho))/B)
-            x_hat = x_cur + (rho*(-B)*(t_cur**((2*rho-1)/rho)+t_hat**((2*rho-1)/rho))).sqrt() * S_noise * correlated_noise[0]
-        else:
-            # # beta * g(t) = (dt)^0.5 * (sigma^2_t)'^0.5
-            # x_hat = x_cur + ((t_cur**(1/rho)-t_hat**(1/rho))/B).sqrt() * (rho*(-B)*(t_cur**((2*rho-1)/rho)+t_hat**((2*rho-1)/rho))).sqrt() * S_noise*randn_like(x_cur)
-            x_hat = x_cur + (t_hat ** 2 - t_cur ** 2).sqrt() * S_noise*randn_like(x_cur)
-        # if gamma>0:
-        #     denoised_ = net(x_cur, t_hat, class_labels).to(torch.float64)
-        #     d_cur_ = (x_cur - denoised_) / t_hat
+        # # beta * g(t) = (dt)^0.5 * (sigma^2_t)'^0.5
+        # x_hat = x_cur + ((t_cur**(1/rho)-t_hat**(1/rho))/B).sqrt() * (rho*(-B)*(t_cur**((2*rho-1)/rho)+t_hat**((2*rho-1)/rho))).sqrt() * S_noise*randn_like(x_cur)
+        x_hat = x_cur + (t_hat ** 2 - t_cur ** 2).sqrt() * S_noise*randn_like(x_cur)
         
         # # Euler step.
+        if i>0:
+            # noise = randn_like(x_cur)/(2**0.5)+d_cur/(2**0.5)
+            # x_hat = denoised+t_hat*noise
+            x_next = t_next/t_hat*denoised+t_next*d_cur
         denoised = net(x_hat, t_hat, class_labels).to(torch.float64)
         d_cur = (x_hat - denoised) / t_hat
-        x_next = x_hat + d_cur * (t_next - t_hat)       # negative delta-t here (t_next - t_hat)
+        if i==0: x_next = x_hat + d_cur * (t_next - t_hat)       # negative delta-t here (t_next - t_hat)
+        else: x_next = x_next + (1-t_next/t_hat)*denoised
         
         # # Apply 2nd order correction.
-        if i < num_steps - 1:
-            denoised = net(x_next, t_next, class_labels).to(torch.float64)
-            d_prime = (x_next - denoised) / t_next
+        # if i < num_steps - 1:
+        #     denoised = net(x_next, t_next, class_labels).to(torch.float64)
+        #     d_prime = (x_next - denoised) / t_next
+        #     d_prime = (t_next*d_prime+t_hat*d_cur)/(t_next+t_hat)
+        #     x_next = x_hat + d_prime*(t_next - t_hat)
 
-            d_prime = 0.5*(d_prime+d_cur)
-            x_next = x_hat + d_prime*(t_next - t_hat)
-            # x_next = x_hat + (0.5 * d_cur + 0.5 * d_prime) * (t_next**(1/rho) - t_hat**(1/rho)) * rho/2 * (t_hat**((rho-1)/rho)+t_next**((rho-1)/rho))
-            # x_next = x_hat + (0.5 * d_cur + 0.5 * d_prime) * (t_next - t_hat)
-        if i > 0:
-            # d_last = n*d_last/(n+1) + d_cur/(n+1)
-            d1 = (d_last).view(x_cur.shape[0], -1)
-            l1 = d1.pow(2).sum().sqrt()
-            d2 = (d_prime).view(x_cur.shape[0], -1)
-            l2 = d2.pow(2).sum().sqrt()
-            # print(f'noise: {gamma>0} | gap: {(d2-d1).pow(2).max().item():.2f} | cosine: {(d1.mm(d2.t())/l1/l2).item():.6f} | l1: {l1.item():.2f} | l2: {l2.item():.2f} | d1 saturation: {(d1.abs()>1e-2).sum()/d1.shape[1]*100:.2f}% | d2 saturation: {(d2.abs()>1e-2).sum()/d2.shape[1]*100:.2f}%')
-            print(f'{(d1.mm(d2.t())/l1/l2).item():.2f},', end='')
-        # if gamma > 0 and i%10 == 0:
-        #     # if i > 0: x_next = x_cur + gamma*d_last
-        else: d_last = d_prime
-    print(']')
+        # # Logger
+        # if 0< i < num_steps-1:
+        #     # d_last = n*d_last/(n+1) + d_cur/(n+1)
+        #     d1 = d_prime
+        #     l1 = d1.pow(2).sum().sqrt()
+        #     d2 = d_last
+        #     l2 = d2.pow(2).sum().sqrt()
+        #     print(f'noise: {gamma>0} | rate: {((d2-d1).pow(2).max().sqrt()).item():.2f} | cosine: {((d1*d2).sum()/l1/l2).item():.6f} | l1: {l1.item():.2f} | l2: {l2.item():.2f}')
+        # d_last = d_prime
     return x_next
 
 #----------------------------------------------------------------------------
 # Our new 1st-order sampler.
 
-def edm_sampler(
-    net, latents, class_labels=None,
+def edm_sampler_(
+    net, latents, class_labels=None, randn_like=torch.randn_like,
     num_steps=18, sigma_min=0.002, sigma_max=80, rho=7,
     S_churn=0, S_min=0, S_max=float('inf'), S_noise=1,
 ):
+    '''
+    Recurrent diffusion
+    '''
+
+    # # Hyperparameters:
+    linear_steps = 1
+    search_steps = 0
+    random_init = 2
 
     # # Adjust noise levels based on what's supported by the network.
     sigma_min = max(sigma_min, net.sigma_min)
-    sigma_med = S_max
+    sigma_med = min(S_max, sigma_max)
     sigma_max = min(sigma_max, net.sigma_max)
     A = sigma_med ** (1 / rho)
     B = sigma_min ** (1 / rho) - sigma_med ** (1 / rho)
 
     # # First linear steps / random search steps
-    linear_steps = 1
-    search_steps = 0
     search_steps = list([i*search_steps for i in range(1, linear_steps+1)])
+    # search_steps = [0, 30, 0]
     ode_step_indices = torch.arange(linear_steps, dtype=torch.float64, device=latents.device)
     ode_sigmas = (sigma_max**(1/rho) + ode_step_indices/(linear_steps)*(sigma_med**(1/rho)-sigma_max**(1/rho)))**rho
-    # ode_sigmas = torch.tensor([80, 20, 5], dtype=torch.float64, device=latents.device)
+    # ode_sigmas = torch.tensor([80, 20, 10], dtype=torch.float64, device=latents.device)
 
     # # Time step discretization, turn time-steps into sigma-schedule
     step_indices = torch.arange(num_steps, dtype=torch.float64, device=latents.device)
     sigmas = (A + step_indices/(num_steps-1)*B) ** rho
     sigmas = torch.cat([net.round_sigma(ode_sigmas), net.round_sigma(sigmas), torch.zeros_like(sigmas[:1])]) # t_N = 0
+    # print(sigmas)
+    # exit()
 
     # # Main sampling loop.
+    flag = False
     x_next = latents.to(torch.float64) * sigmas[0]
-    for i, (sigma_cur, sigma_next) in enumerate(zip(sigmas[:-1], sigmas[1:])): # 0, ..., N-1
-        # # expanded drift
-        # dt = (sigma_next**(1/rho) - sigma_cur**(1/rho))/B
-        # gamma=torch.tensor(0.0, dtype=torch.float64, device=latents.device)
-        # prod=torch.tensor(1.0, dtype=torch.float64, device=latents.device)
-        # for j in range(1, int(rho)+1):
-        #     prod *= (B*(rho-j+1)/j)
-        #     gamma += dt**(j)*prod*sigma_cur**((rho-j)/rho)
+    for round in range(random_init):
+        # # Time step discretization, turn time-steps into sigma-schedule
+        # step_indices = torch.arange(num_steps-round, dtype=torch.float64, device=latents.device)
+        # sigmas = (A + step_indices/(num_steps-round-1)*B) ** rho
+        # sigmas = torch.cat([net.round_sigma(ode_sigmas), net.round_sigma(sigmas), torch.zeros_like(sigmas[:1])]) # t_N = 0
+        if round > 0:
+            flag = True
+        for i, (sigma_cur, sigma_next) in enumerate(zip(sigmas[:-1], sigmas[1:])): # 0, ..., N-1
 
-        # # Euler step.
-        denoised = net(x_next, sigma_cur, class_labels).to(torch.float64)
-        d_cur = (x_next - denoised) / sigma_cur
-        x_next = x_next + (sigma_next-sigma_cur)*d_cur
+            '''
+            Taylor expansion of drift term can help compute diffusion step-size precisely.
+            Apply when dt is of interest.
+            '''
+            # dt = (sigma_next**(1/rho) - sigma_cur**(1/rho))/B
+            # gamma=torch.tensor(0.0, dtype=torch.float64, device=latents.device)
+            # prod=torch.tensor(1.0, dtype=torch.float64, device=latents.device)
+            # for j in range(1, int(rho)+1):
+            #     prod *= (B*(rho-j+1)/j)
+            #     gamma += dt**(j)*prod*sigma_cur**((rho-j)/rho)
 
-        # # Brownian motion
-        # dt.pow(3)*2*(-B).pow(3)*t_cur**((2*rho-3)/rho)+dt.pow(4)*6*(-B).pow(4)*t_cur**((2*rho-4)/rho)+dt.pow(5)*6*(-B).pow(5)*t_cur**((2*rho-5)/rho)+dt.pow(6)*(-B).pow(6)
-        # diffusion_coff = 2 * dt**((1+rho)/2)*((-B)**(rho)*sigma_cur).sqrt()
-        if i<linear_steps :
-            d_best = float('inf')
+            '''
+            Random init: start with aiming at denoised return from last epoch
+            '''
+            if flag:
+                diffusion_coff = 2*sigma_med
+                noise = randn_like(x_next)
+                x_next = x_next + diffusion_coff * noise
+                d_cur = (x_next - denoised) /diffusion_coff
+                x_next = x_next + (sigma_med-diffusion_coff)*d_cur
+                flag = False
+                continue
+
+            '''
+            # # Apply same Euler step in phase 1: Empirically no performance gaining.
+            # if 0<i<linear_steps:
+            #     d_cur = (x_next - denoised) / sigma_cur
+            #     x_next = x_next + (sigma_next-sigma_cur)*d_cur
+            #     continue
+            '''
+
+            # # Euler step.
             x_cur = x_next
-            diffusion_coff = 2**0.5-1
-            sigma_cur = (1+diffusion_coff)*sigma_next
-            for _ in range(search_steps[i]):
-                noise = torch.randn_like(x_next)
-                x_hat = x_cur + (diffusion_coff**2 + 2*diffusion_coff)**0.5*sigma_next * noise
-                denoised = net(x_hat, sigma_cur, class_labels).to(torch.float64)
-                d_search = (x_hat - denoised) / sigma_cur
-                if (d_search**2).sum().sqrt() < d_best:
-                    d_best = (d_search**2).sum().sqrt()
-                    x_next = x_hat + (sigma_next-sigma_cur)*d_search
+            denoised = net(x_cur, sigma_cur, class_labels).to(torch.float64)
+            d_cur = (x_cur - denoised) / sigma_cur
+            x_next = x_cur + (sigma_next-sigma_cur)*d_cur
 
-        # # Logger
-        # if i > 0:
-        #     d1 = d_cur.view(1, -1)
-        #     l1 = d1.pow(2).sum().sqrt()
-        #     d2 = d_last.view(1, -1)
-        #     l2 = d2.pow(2).sum().sqrt()
-        #     # print(f'sigma: {sigma_cur} | noise: {flag} | gap: {(d1-d2).pow(2).max().item():.2f} | cosine: {(d1.mm(d2.t())/l1/l2).item():.6f} | l1: {l1.item():.2f} | l2: {l2.item():.2f} | d1 saturation: {(d1.abs()>1e-2).sum()/d1.shape[1]*100:.2f}% | d2 saturation: {(d2.abs()>1e-2).sum()/d2.shape[1]*100:.2f}%')
-        # else: d_last = d_cur
+            # # Brownian motion
+            # dt.pow(3)*2*(-B).pow(3)*t_cur**((2*rho-3)/rho)+dt.pow(4)*6*(-B).pow(4)*t_cur**((2*rho-4)/rho)+dt.pow(5)*6*(-B).pow(5)*t_cur**((2*rho-5)/rho)+dt.pow(6)*(-B).pow(6)
+            # diffusion_coff = 2 * dt**((1+rho)/2)*((-B)**(rho)*sigma_cur).sqrt()
+            # if i<linear_steps :
+            #     # l1=d_cur.pow(2).sum().sqrt()
+            #     d_best = 0
+            #     x_cur = x_next
+            #     diffusion_coff = 2**0.5-1
+            #     sigma_cur = (1+diffusion_coff)*sigma_next
+            #     for _ in range(search_steps[i]):
+            #         noise = torch.randn_like(x_next)
+            #         x_hat = x_cur + (diffusion_coff**2 + 2*diffusion_coff)**0.5*sigma_next * noise
+            #         denoised = net(x_hat, sigma_cur, class_labels).to(torch.float64)
+            #         d_search = (x_hat - denoised) / sigma_cur
+            #         # RGBimg = ((x_hat+(sigma_next-sigma_cur)*d_search)*127.5+128).clip(0, 255).to(torch.uint8)
+            #         # Rhist = torch.histc(RGBimg[0,0], bins=256, min=0, max=255)/RGBimg[0,0].numel()
+            #         # Rlogits = torch.log(Rhist+1e-6)
+            #         # Rentropy = -(Rhist*Rlogits).sum()
+            #         # Ghist = torch.histc(RGBimg[0,1], bins=256, min=0, max=255)/RGBimg[0,1].numel()
+            #         # Glogits = torch.log(Ghist+1e-6)
+            #         # Gentropy = -(Ghist*Glogits).sum()
+            #         # Bhist = torch.histc(RGBimg[0,2], bins=256, min=0, max=255)/RGBimg[0,2].numel()
+            #         # Blogits = torch.log(Bhist+1e-6)
+            #         # Bentropy = -(Bhist*Blogits).sum()
+            #         if d_search.pow(2).sum().sqrt() >= d_best:
+            #             x_cur = x_hat + (sigma_next-sigma_cur)*d_search
+            #     x_next = x_cur
+
+            # # Logger
+            # if i > 0:
+            #     d1=d_cur
+            #     d2=d_last
+            #     l1 = d1.pow(2).sum().sqrt()
+            #     l2 = d2.pow(2).sum().sqrt()
+            #     print(f'sigma: {sigma_cur} | gap: {(d1-d2).pow(2).max().item():.2f} | cosine: {((d1*d2).sum()/l1/l2).item():.6f} | l1: {l1.item():.2f} | l2: {l2.item():.2f} | d1 saturation: {(d1.abs()>1e-2).sum()/d1.shape[1]*100:.2f}% | d2 saturation: {(d2.abs()>1e-2).sum()/d2.shape[1]*100:.2f}%')
+            # d_last = d_cur
         
-        # # Heun step
-        # if linear_steps <= i < linear_steps+num_steps - 1:
-        #     denoised = net(x_next, sigma_next, class_labels).to(torch.float64)
-        #     # gamma_next=torch.tensor(0.0, dtype=torch.float64, device=latents.device)
-        #     # prod=torch.tensor(1.0, dtype=torch.float64, device=latents.device)
-        #     # for j in range(1, int(rho)):
-        #     #     prod *= (B*(rho-j+1)/j)
-        #     #     gamma_next += dt**(j-1)*prod*sigma_next**((rho-j)/rho)
-        #     d_prime = (x_next - denoised) / sigma_next
-        #     d_prime = (d_prime-d_cur)/2
-        #     x_next = x_next + (sigma_next-sigma_cur)*d_prime
+            # # Second order correction
+            if linear_steps < i < linear_steps+num_steps - 1:
+                denoised = net(x_next, sigma_next, class_labels).to(torch.float64)
+                d_prime = (x_next - denoised) / sigma_next
+                d_prime = (sigma_next*d_prime+sigma_cur*d_cur)/(sigma_cur+sigma_next)
+                x_next = x_cur + (sigma_next-sigma_cur)*d_prime
 
     return x_next
 
@@ -448,7 +489,7 @@ def parse_int_list(s):
 @click.option('--subdirs',                 help='Create subdirectory for every 1000 seeds',                         is_flag=True)
 @click.option('--class', 'class_idx',      help='Class label  [default: random]', metavar='INT',                    type=click.IntRange(min=0), default=None)
 @click.option('--batch', 'max_batch_size', help='Maximum batch size', metavar='INT',                                type=click.IntRange(min=1), default=64, show_default=True)
-# sampler
+# sampler_kwargs
 @click.option('--steps', 'num_steps',      help='Number of sampling steps', metavar='INT',                          type=click.IntRange(min=1), default=18, show_default=True)
 @click.option('--sigma_min',               help='Lowest noise level  [default: varies]', metavar='FLOAT',           type=click.FloatRange(min=0, min_open=True))
 @click.option('--sigma_max',               help='Highest noise level  [default: varies]', metavar='FLOAT',          type=click.FloatRange(min=0, min_open=True))
@@ -466,7 +507,7 @@ def parse_int_list(s):
 @click.option('--schedule',                help='Ablate noise schedule sigma(t)', metavar='vp|ve|linear',           type=click.Choice(['vp', 've', 'linear']))
 @click.option('--scaling',                 help='Ablate signal scaling s(t)', metavar='vp|none',                    type=click.Choice(['vp', 'none']))
 
-def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, device=torch.device('cuda'), **sampler_kwargs):
+def main(network_pkl, outdir, seeds, subdirs, class_idx, max_batch_size, device=torch.device('cuda'), **sampler_kwargs):
 
     dist.init()
     num_batches = ((len(seeds) - 1) // (max_batch_size * dist.get_world_size()) + 1) * dist.get_world_size()
@@ -515,7 +556,7 @@ def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, device=
         # if 'randn_like' in sampler_kwargs and type(sampler_kwargs['randn_like']) is str:
         #     sampler_kwargs['randn_like'] = rnd.randn_like if sampler_kwargs['randn_like'] == 'db' else rnd.multiGaussian_like
         sampler_fn = ablation_sampler if have_ablation_kwargs else edm_sampler
-        images = sampler_fn(net, latents, class_labels, **sampler_kwargs)
+        images = sampler_fn(net, latents, class_labels, randn_like=rnd.randn_like, **sampler_kwargs)
 
         # Save images.
         images_np = (images * 127.5 + 128).clip(0, 255).to(torch.uint8).permute(0, 2, 3, 1).cpu().numpy()

@@ -99,7 +99,7 @@ def main(**kwargs):
     net_list = list(net_dict.keys())
     assert len(ema_list)==len(net_list)
     net.load_state_dict(ema_dict)
-    net = net.eval().requires_grad_(False)
+    net = net.requires_grad_(False)
     print(ema_list[:10])
     for name,param in net.named_parameters(): assert param.requires_grad==False
     print(net_list[:10])
