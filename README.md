@@ -72,7 +72,7 @@ python generate.py --outdir=out --steps=40 \
 python generate.py --outdir=Sampler1.2.0/ffhq_N84_rho3_2nd --network=ckpts/edm-ffhq-64x64-uncond-vp.pkl --batch=250 --seeds=0-49999 --steps=84 --randn_like=ddb --rho=3 --subdirs
 
 # For ImageNet at 64x64, use stochastic sampling with 256 steps (NFE = 511)
-python generate.py --outdir=imgSamples --network=https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-imagenet-64x64-cond-adm.pkl --batch=100 --seeds=0-999 --steps=40 --rho=3 --subdirs --S_max=5.0 --class=164
+python generate.py --outdir=imgSamples --network=https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-imagenet-64x64-cond-adm.pkl --batch=100 --seeds=0-1 --steps=80 --rho=3 --subdirs --class=164 --S_max=5.0
 ```
 
 ## Calculating FID
