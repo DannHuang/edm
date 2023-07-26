@@ -37,15 +37,17 @@ class VPLoss:
 
 @persistence.persistent_class
 class VELoss:
-    def __init__(self, sigma_min=0.02, sigma_max=100):
+    def __init__(self, sigma_min=0.02, sigma_max=80.0):
         self.sigma_min = sigma_min
         self.sigma_max = sigma_max
 
     def __call__(self, lambdas, diffusion_net, images, labels, augment_pipe=None):
         sigmas=lambdas()
+        print(sigmas)
         length=sigmas.shape[0]
-        rnd_index = torch.randint(length+1, [images.shape[0], 1, 1, 1], device=images.device)
-        sigma = self.sigma_max * torch.prod(sigmas[rnd_index:]) if rnd_index<length else self.sigma_max
+        rnd_index = torch.randint(length+1, [1], device=images.device)
+        # images.shape[0]
+        sigma = self.sigma_max * torch.prod(sigmas[rnd_index:]) if rnd_index<length else torch.tensor(self.sigma_max, dtype=torch.float32, device=images.device)
         weight = 1/sigmas[rnd_index-1]-1 if rnd_index>0 else 1
         y, augment_labels = augment_pipe(images) if augment_pipe is not None else (images, None)
         n = torch.randn_like(y) * sigma

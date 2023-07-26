@@ -16,7 +16,7 @@ import psutil
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.functional as F
+import torch.nn.functional as F
 import dnnlib
 from torch_utils import distributed as dist
 from torch_utils import training_stats
@@ -83,10 +83,11 @@ def training_loop(
 
     # Load pre-trained DPM and construct sigma network.
     dist.print0(f'Loading network from model zoo "{network_dir}"...')
-    with open(network_dir, 'rb') as f:
-        net = pickle.load(f).to(device)
+    with dnnlib.util.open_url(network_dir, verbose=True) as f:
+        net = pickle.load(f)['ema'].to(device)
     net.eval().requires_grad_(False).to(device)
     lambdas = sigma_net(dm_length)
+    lambdas.train().requires_grad_().to(device)
     if dist.get_rank() == 0:
         with torch.no_grad():
             images = torch.zeros([batch_gpu, net.img_channels, net.img_resolution, net.img_resolution], device=device)
@@ -99,8 +100,8 @@ def training_loop(
     dist.print0('Setting up optimizer...')
     loss_fn = dnnlib.util.construct_class_by_name(**loss_kwargs) # training.loss.(VP|VE|EDM)Loss
     optimizer = dnnlib.util.construct_class_by_name(params=lambdas.parameters(), **optimizer_kwargs) # subclass of torch.optim.Optimizer
-    augment_pipe = dnnlib.util.construct_class_by_name(**augment_kwargs) if augment_kwargs is not None else None # training.augment.AugmentPipe
-    ddp = torch.nn.parallel.DistributedDataParallel(net, device_ids=[device], broadcast_buffers=False)
+    # augment_pipe = dnnlib.util.construct_class_by_name(**augment_kwargs) if augment_kwargs is not None else None # training.augment.AugmentPipe
+    # ddp = torch.nn.parallel.DistributedDataParallel(net, device_ids=[device], broadcast_buffers=False)
     # ema = copy.deepcopy(net).eval().requires_grad_(False)
 
     # Resume training from previous snapshot.
@@ -136,14 +137,14 @@ def training_loop(
 
         # Accumulate gradients.
         optimizer.zero_grad(set_to_none=True)
-        for round_idx in range(num_accumulation_rounds):
-            with misc.ddp_sync(ddp, (round_idx == num_accumulation_rounds - 1)):
-                images, labels = next(dataset_iterator)
-                images = images.to(device).to(torch.float32) / 127.5 - 1
-                labels = labels.to(device)
-                loss = loss_fn(lambdas=lambdas, net=ddp, images=images, labels=labels, augment_pipe=augment_pipe)
-                training_stats.report('Loss/loss', loss)
-                loss.sum().mul(loss_scaling / batch_gpu_total).backward()
+        # for round_idx in range(num_accumulation_rounds):
+        #     with misc.ddp_sync(ddp, (round_idx == num_accumulation_rounds - 1)):
+        images, labels = next(dataset_iterator)
+        images = images.to(device).to(torch.float32) / 127.5 - 1
+        labels = labels.to(device)
+        loss = loss_fn(lambdas=lambdas, diffusion_net=net, images=images, labels=labels, augment_pipe=None)
+        training_stats.report('Loss/loss', loss)
+        loss.sum().mul(loss_scaling / batch_gpu_total).backward()
 
         # Update weights.
         for g in optimizer.param_groups:
@@ -152,7 +153,6 @@ def training_loop(
             if param.grad is not None:
                 torch.nan_to_num(param.grad, nan=0, posinf=1e5, neginf=-1e5, out=param.grad)
         optimizer.step()
-
         # Update EMA.
         # ema_halflife_nimg = ema_halflife_kimg * 1000
         # if ema_rampup_ratio is not None:

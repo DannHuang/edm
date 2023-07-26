@@ -15,7 +15,7 @@ import click
 import torch
 import dnnlib
 from torch_utils import distributed as dist
-from training import training_loop
+from training import sigma_training_loop
 
 import warnings
 warnings.filterwarnings('ignore', 'Grad strides do not match bucket view strides') # False warning printed by PyTorch 1.12.
@@ -45,7 +45,8 @@ def parse_int_list(s):
 @click.option('--data',          help='Path to the dataset', metavar='ZIP|DIR',                     type=str, required=True)
 @click.option('--cond',          help='Train class-conditional model', metavar='BOOL',              type=bool, default=False, show_default=True)
 @click.option('--arch',          help='Network architecture', metavar='ddpmpp|ncsnpp|adm',          type=click.Choice(['ddpmpp', 'ncsnpp', 'adm']), default='ddpmpp', show_default=True)
-@click.option('--precond',       help='Preconditioning & loss function', metavar='vp|ve|edm',       type=click.Choice(['vp', 've', 'edm']), default='edm', show_default=True)
+@click.option('--precond',       help='Preconditioning & loss function', metavar='vp|ve|edm|sigma', type=click.Choice(['vp', 've', 'edm', 'sigma']), default='edm', show_default=True)
+@click.option('--pretrain',      help='Pretrained DPM url', metavar='PKL|URL',                      type=str)
 
 # Hyperparameters.
 @click.option('--duration',      help='Training duration', metavar='MIMG',                          type=click.FloatRange(min=0, min_open=True), default=200, show_default=True)
@@ -58,7 +59,7 @@ def parse_int_list(s):
 @click.option('--dropout',       help='Dropout probability', metavar='FLOAT',                       type=click.FloatRange(min=0, max=1), default=0.13, show_default=True)
 @click.option('--augment',       help='Augment probability', metavar='FLOAT',                       type=click.FloatRange(min=0, max=1), default=0.12, show_default=True)
 @click.option('--xflip',         help='Enable dataset x-flips', metavar='BOOL',                     type=bool, default=False, show_default=True)
-@click.option('--dm-length',     help='sigma length', metavar='INT',                                type=click.IntRange(min=1), default=10, show_default=True)
+@click.option('--dm_length',     help='sigma length', metavar='INT',                                type=click.IntRange(min=1), default=10, show_default=True)
 
 # Performance-related.
 @click.option('--fp16',          help='Enable mixed-precision training', metavar='BOOL',            type=bool, default=False, show_default=True)
@@ -106,7 +107,7 @@ def main(**kwargs):
         dataset_obj = dnnlib.util.construct_class_by_name(**c.dataset_kwargs)
         dataset_name = dataset_obj.name
         c.dataset_kwargs.resolution = dataset_obj.resolution # be explicit about dataset resolution
-        print(f'res={dataset_obj.resolution}, num_channels={dataset_obj.num_channels}, label dim={dataset_obj.label_dim}')
+        # print(f'res={dataset_obj.resolution}, num_channels={dataset_obj.num_channels}, label dim={dataset_obj.label_dim}')
         c.dataset_kwargs.max_size = len(dataset_obj) # be explicit about dataset size
         if opts.cond and not dataset_obj.has_labels:
             raise click.ClickException('--cond=True requires labels specified in dataset.json')
@@ -200,6 +201,8 @@ def main(**kwargs):
         prev_run_ids = [int(x.group()) for x in prev_run_ids if x is not None]
         cur_run_id = max(prev_run_ids, default=-1) + 1
         c.run_dir = os.path.join(opts.outdir, f'{cur_run_id:05d}-{desc}')
+        c.dm_length = opts.dm_length
+        c.network_dir = opts.pretrain
         assert not os.path.exists(c.run_dir)
 
     # Print options.
@@ -231,7 +234,7 @@ def main(**kwargs):
         dnnlib.util.Logger(file_name=os.path.join(c.run_dir, 'log.txt'), file_mode='a', should_flush=True)
 
     # Train.
-    training_loop.sigma_training_loop(**c)
+    sigma_training_loop.training_loop(**c)
 
 #----------------------------------------------------------------------------
 
