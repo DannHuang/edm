@@ -58,6 +58,7 @@ def parse_int_list(s):
 @click.option('--dropout',       help='Dropout probability', metavar='FLOAT',                       type=click.FloatRange(min=0, max=1), default=0.13, show_default=True)
 @click.option('--augment',       help='Augment probability', metavar='FLOAT',                       type=click.FloatRange(min=0, max=1), default=0.12, show_default=True)
 @click.option('--xflip',         help='Enable dataset x-flips', metavar='BOOL',                     type=bool, default=False, show_default=True)
+@click.option('--dm-length',     help='sigma length', metavar='INT',                                type=click.IntRange(min=1), default=10, show_default=True)
 
 # Performance-related.
 @click.option('--fp16',          help='Enable mixed-precision training', metavar='BOOL',            type=bool, default=False, show_default=True)
@@ -112,7 +113,6 @@ def main(**kwargs):
         del dataset_obj # conserve memory
     except IOError as err:
         raise click.ClickException(f'--data: {err}')
-    exit()
     
     # Network architecture.
     if opts.arch == 'ddpmpp':
@@ -132,6 +132,9 @@ def main(**kwargs):
     elif opts.precond == 've':
         c.network_kwargs.class_name = 'training.networks.VEPrecond'
         c.loss_kwargs.class_name = 'training.loss.VELoss'
+    elif opts.precond == 'sigma':
+        c.network_kwargs.class_name = 'training.networks.EDMPrecond'
+        c.loss_kwargs.class_name = 'training.sigma_loss.VELoss'
     else:
         assert opts.precond == 'edm'    # DEFUALT
         c.network_kwargs.class_name = 'training.networks.EDMPrecond'
@@ -228,7 +231,7 @@ def main(**kwargs):
         dnnlib.util.Logger(file_name=os.path.join(c.run_dir, 'log.txt'), file_mode='a', should_flush=True)
 
     # Train.
-    training_loop.training_loop(**c)
+    training_loop.sigma_training_loop(**c)
 
 #----------------------------------------------------------------------------
 

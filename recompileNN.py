@@ -97,9 +97,6 @@ def main(**kwargs):
     net.load_state_dict(ema_dict)
     net = net.eval().requires_grad_(False)
     for name,param in net.named_parameters(): assert param.requires_grad==False
-    print(net_list[:10])
-    print(type(net.parameters()))
-    exit()
 
     print(f'Wrting network to pkl file "{model_dir}"...')
     with open(model_dir, 'wb') as f:
