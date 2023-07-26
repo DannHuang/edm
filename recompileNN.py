@@ -28,12 +28,6 @@ def parse_int_list(s):
 
 # Main options.
 @click.option('--pkl_dir',        help='url to nvidia model zoo', metavar='DIR',                     type=str, required=True)
-@click.option('--arch',           help='Network architecture', metavar='ddpmpp|ncsnpp|adm',          type=click.Choice(['ddpmpp', 'ncsnpp', 'adm']), default='ddpmpp', show_default=True)
-@click.option('--precond',        help='Preconditioning & loss function', metavar='vp|ve|edm',       type=click.Choice(['vp', 've', 'edm']), default='edm', show_default=True)
-@click.option('--cbase',          help='Channel multiplier  [default: varies]', metavar='INT',       type=int)
-@click.option('--cres',           help='Channels per resolution  [default: varies]', metavar='LIST', type=parse_int_list)
-@click.option('--augment',        help='Augment probability', metavar='FLOAT',                       type=click.FloatRange(min=0, max=1), default=0.12, show_default=True)
-@click.option('--dropout',        help='Dropout probability', metavar='FLOAT',                       type=click.FloatRange(min=0, max=1), default=0.13, show_default=True)
 @click.option('--fp16',           help='Enable mixed-precision training', metavar='BOOL',            type=bool, default=True, show_default=True)
 
 def main(**kwargs):
@@ -46,66 +40,66 @@ def main(**kwargs):
         label_dim=10
         model_dir = 'ckpts/edm-cifar10-32x32-cond-vp.pkl'
         arc = 'ddpmpp'
+        cond=1
+        cres=None
     if args.pkl_dir == 'https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-imagenet-64x64-cond-adm.pkl':
         res=64
         num_channels=3
         label_dim=1000
         model_dir = 'ckpts/edm-imagenet-64x64-cond-adm.pkl'
         arc='adm'
+        augment=0
+        cond=1
+        cres=None
     if args.pkl_dir =='https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-ffhq-64x64-uncond-vp.pkl':
         res=64
         num_channels=3
         label_dim=0
         model_dir = 'ckpts/edm-ffhq-64x64-uncond-vp.pkl'
         arc='ddpmpp'
+        augment=0.15
+        cond=0
+        cres=[1,2,2,2]
 
-    if args.arch == 'ddpmpp':
+    if arc == 'ddpmpp':
         network_kwargs.update(model_type='SongUNet', embedding_type='positional', encoder_type='standard', decoder_type='standard')
         network_kwargs.update(channel_mult_noise=1, resample_filter=[1,1], model_channels=128, channel_mult=[2,2,2])
-    elif args.arch == 'ncsnpp':
+    elif arc == 'ncsnpp':
         network_kwargs.update(model_type='SongUNet', embedding_type='fourier', encoder_type='residual', decoder_type='standard')
         network_kwargs.update(channel_mult_noise=2, resample_filter=[1,3,3,1], model_channels=128, channel_mult=[2,2,2])
     else:       
-        assert args.arch == 'adm'
+        assert arc == 'adm'
         network_kwargs.update(model_type='DhariwalUNet', model_channels=192, channel_mult=[1,2,3,4])
     
-    if args.precond == 'vp':
-        network_kwargs.class_name = 'training.networks.VPPrecond'
-    elif args.precond == 've':
-        network_kwargs.class_name = 'training.networks.VEPrecond'
-    else:
-        assert args.precond == 'edm'
-        network_kwargs.class_name = 'training.networks.EDMPrecond'
-    if args.cbase is not None:
-        network_kwargs.model_channels = args.cbase
-    if args.cres is not None:
-        network_kwargs.channel_mult = args.cres
-    if args.augment:
-        augment_kwargs = dnnlib.EasyDict(class_name='training.augment.AugmentPipe', p=args.augment)
+    network_kwargs.class_name = 'training.networks.EDMPrecond'
+    if cres is not None:
+        network_kwargs.channel_mult = cres
+    if augment:
+        augment_kwargs = dnnlib.EasyDict(class_name='training.augment.AugmentPipe', p=augment)
         network_kwargs.augment_dim = 9
-    network_kwargs.update(dropout=args.dropout, use_fp16=args.fp16)
+    # network_kwargs.update(dropout=args.dropout, use_fp16=args.fp16)
     interface_kwargs = dict(img_resolution=res, img_channels=num_channels, label_dim=label_dim)
     # interface_kwargs = dict(img_resolution=32, img_channels=3, label_dim=10)
 
     print(f'Loading network pkl file from "{args.pkl_dir}"...')
     with dnnlib.util.open_url(args.pkl_dir, verbose=True) as f:
         ema_net = pickle.load(f)['ema'].to('cpu')
-        # with fwAD.dual_level():
-        #     dual_input = fwAD.make_dual(x_test, tan)
-        #     dual_out = ema_net(dual_input, torch.tensor(0.5), torch.zeros(1,1000))
 
     # # load state_dict to new NN and save model
     ema_dict = ema_net.state_dict()
     ema_list = list(ema_dict.keys())
+    # print(ema_list[:10])
     net = dnnlib.util.construct_class_by_name(**network_kwargs, **interface_kwargs)
     net_dict = net.state_dict()
     net_list = list(net_dict.keys())
-    assert len(ema_list)==len(net_list)
+    # print(net_list[:10])
+    assert len(ema_list)==len(net_list), f'{len(ema_list)} not matching {len(net_list)}'
     net.load_state_dict(ema_dict)
     net = net.eval().requires_grad_(False)
-    print(ema_list[:10])
     for name,param in net.named_parameters(): assert param.requires_grad==False
     print(net_list[:10])
+    print(type(net.parameters()))
+    exit()
 
     print(f'Wrting network to pkl file "{model_dir}"...')
     with open(model_dir, 'wb') as f:
