@@ -150,6 +150,7 @@ def training_loop(
         for g in optimizer.param_groups:
             g['lr'] = optimizer_kwargs['lr'] * min(cur_nimg / max(lr_rampup_kimg * 1000, 1e-8), 1)
         for param in lambdas.parameters():
+            print(param.grad)
             if param.grad is not None:
                 torch.nan_to_num(param.grad, nan=0, posinf=1e5, neginf=-1e5, out=param.grad)
         optimizer.step()

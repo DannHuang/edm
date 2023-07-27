@@ -16,6 +16,7 @@ import torch
 import dnnlib
 from torch_utils import distributed as dist
 from training import sigma_training_loop
+from training import training_loop
 
 import warnings
 warnings.filterwarnings('ignore', 'Grad strides do not match bucket view strides') # False warning printed by PyTorch 1.12.
@@ -94,7 +95,7 @@ def main(**kwargs):
     torch.multiprocessing.set_start_method('spawn')
     dist.init()
 
-    # Initialize config dict.
+    # Initialize config-dict.
     c = dnnlib.EasyDict()
     c.dataset_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderDataset', path=opts.data, use_labels=opts.cond, xflip=opts.xflip, cache=opts.cache)
     c.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=opts.workers, prefetch_factor=2)
