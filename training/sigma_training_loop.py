@@ -69,11 +69,11 @@ def training_loop(
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
 
     # Select batch size per GPU.
-    batch_gpu_total = batch_size // dist.get_world_size()
+    batch_gpu_total = batch_size // dist.get_world_size()       # batch per GPU
     if batch_gpu is None or batch_gpu > batch_gpu_total:
-        batch_gpu = batch_gpu_total
-    num_accumulation_rounds = batch_gpu_total // batch_gpu
-    assert batch_size == batch_gpu * num_accumulation_rounds * dist.get_world_size()
+        batch_gpu = batch_gpu_total                             # batch_gpu <= batch_gpu_total
+    num_accumulation_rounds = batch_gpu_total // batch_gpu      # allow for accumulated size larger than batch size
+    assert batch_size == batch_gpu * num_accumulation_rounds * dist.get_world_size()    # check total batch size
 
     # Load dataset.
     dist.print0('Loading dataset...')
@@ -82,12 +82,12 @@ def training_loop(
     dataset_iterator = iter(torch.utils.data.DataLoader(dataset=dataset_obj, sampler=dataset_sampler, batch_size=batch_gpu, **data_loader_kwargs))
 
     # Load pre-trained DPM and construct sigma network.
-    dist.print0(f'Loading network from model zoo "{network_dir}"...')
+    dist.print0(f'Loading network from "{network_dir}"...')
     with dnnlib.util.open_url(network_dir, verbose=True) as f:
         net = pickle.load(f)['ema'].to(device)
     net.eval().requires_grad_(False).to(device)
-    lambdas = sigma_net(dm_length)
-    lambdas.train().requires_grad_().to(device)
+    lambda_net = sigma_net(dm_length)
+    lambda_net.train().requires_grad_().to(device)
     if dist.get_rank() == 0:
         with torch.no_grad():
             images = torch.zeros([batch_gpu, net.img_channels, net.img_resolution, net.img_resolution], device=device)
@@ -99,9 +99,10 @@ def training_loop(
     # Setup optimizer.
     dist.print0('Setting up optimizer...')
     loss_fn = dnnlib.util.construct_class_by_name(**loss_kwargs) # training.loss.(VP|VE|EDM)Loss
-    optimizer = dnnlib.util.construct_class_by_name(params=lambdas.parameters(), **optimizer_kwargs) # subclass of torch.optim.Optimizer
-    # augment_pipe = dnnlib.util.construct_class_by_name(**augment_kwargs) if augment_kwargs is not None else None # training.augment.AugmentPipe
+    optimizer = dnnlib.util.construct_class_by_name(params=lambda_net.parameters(), **optimizer_kwargs) # subclass of torch.optim.Optimizer
+    augment_pipe = dnnlib.util.construct_class_by_name(**augment_kwargs) if augment_kwargs is not None else None # training.augment.AugmentPipe
     # ddp = torch.nn.parallel.DistributedDataParallel(net, device_ids=[device], broadcast_buffers=False)
+    # ddp = torch.nn.parallel.DistributedDataParallel(lambdas, device_ids=[device], broadcast_buffers=False)
     # ema = copy.deepcopy(net).eval().requires_grad_(False)
 
     # Resume training from previous snapshot.
@@ -130,27 +131,28 @@ def training_loop(
     cur_tick = 0
     tick_start_nimg = cur_nimg
     tick_start_time = time.time()
-    init_time = tick_start_time - start_time
+    maintain_time = tick_start_time - start_time
     dist.update_progress(cur_nimg // 1000, total_kimg)
     stats_jsonl = None
     while True:
 
         # Accumulate gradients.
-        optimizer.zero_grad(set_to_none=True)
-        # for round_idx in range(num_accumulation_rounds):
+        optimizer.zero_grad()
+        for round_idx in range(num_accumulation_rounds):
         #     with misc.ddp_sync(ddp, (round_idx == num_accumulation_rounds - 1)):
-        images, labels = next(dataset_iterator)
-        images = images.to(device).to(torch.float32) / 127.5 - 1
-        labels = labels.to(device)
-        loss = loss_fn(lambdas=lambdas, diffusion_net=net, images=images, labels=labels, augment_pipe=None)
-        training_stats.report('Loss/loss', loss)
-        loss.sum().mul(loss_scaling / batch_gpu_total).backward()
+            images, labels = next(dataset_iterator)
+            images = images.to(device).to(torch.float32) / 127.5 - 1
+            labels = labels.to(device)
+            loss = loss_fn(lambda_net=lambda_net, diffusion_net=net, images=images, labels=labels, augment_pipe=None)
+            training_stats.report('Loss/loss', loss)
+            loss=loss.sum().mul(loss_scaling / batch_gpu_total)
+            loss.backward()
 
         # Update weights.
-        for g in optimizer.param_groups:
-            g['lr'] = optimizer_kwargs['lr'] * min(cur_nimg / max(lr_rampup_kimg * 1000, 1e-8), 1)
-        for param in lambdas.parameters():
-            print(param.grad)
+        # for g in optimizer.param_groups:
+            # g['lr'] = optimizer_kwargs['lr'] * min(cur_nimg / max(lr_rampup_kimg * 1000, 1e-8), 1)
+            # print(g['lr'])
+        for param in lambda_net.parameters():
             if param.grad is not None:
                 torch.nan_to_num(param.grad, nan=0, posinf=1e5, neginf=-1e5, out=param.grad)
         optimizer.step()
@@ -176,12 +178,18 @@ def training_loop(
         fields += [f"time {dnnlib.util.format_time(training_stats.report0('Timing/total_sec', tick_end_time - start_time)):<12s}"]
         fields += [f"sec/tick {training_stats.report0('Timing/sec_per_tick', tick_end_time - tick_start_time):<7.1f}"]
         fields += [f"sec/kimg {training_stats.report0('Timing/sec_per_kimg', (tick_end_time - tick_start_time) / (cur_nimg - tick_start_nimg) * 1e3):<7.2f}"]
-        fields += [f"maintenance {training_stats.report0('Timing/maintenance_sec', init_time):<6.1f}"]
+        fields += [f"maintenance {training_stats.report0('Timing/maintenance_sec', maintain_time):<6.1f}"]
         fields += [f"cpumem {training_stats.report0('Resources/cpu_mem_gb', psutil.Process(os.getpid()).memory_info().rss / 2**30):<6.2f}"]
         fields += [f"gpumem {training_stats.report0('Resources/peak_gpu_mem_gb', torch.cuda.max_memory_allocated(device) / 2**30):<6.2f}"]
         fields += [f"reserved {training_stats.report0('Resources/peak_gpu_mem_reserved_gb', torch.cuda.max_memory_reserved(device) / 2**30):<6.2f}"]
         torch.cuda.reset_peak_memory_stats()
         dist.print0(' '.join(fields))
+        with torch.no_grad():
+            lambdas=lambda_net()
+            ratio=torch.cat([torch.ones_like(lambdas[:1], requires_grad=False)*80.0, lambdas])
+            sigmas=torch.cumprod(ratio, dim=0)
+        sigmas=[f'{s:.3f}'for s in sigmas]
+        dist.print0(f'loss={loss}, sigmas={sigmas}')
 
         # Check for abort.
         if (not done) and dist.should_stop():
@@ -204,8 +212,8 @@ def training_loop(
         #     del data # conserve memory
 
         # Save full dump of the training state.
-        if (state_dump_ticks is not None) and (done or cur_tick % state_dump_ticks == 0) and cur_tick != 0 and dist.get_rank() == 0:
-            torch.save(dict(net=lambdas, optimizer_state=optimizer.state_dict()), os.path.join(run_dir, f'training-state-{cur_nimg//1000:06d}.pt'))
+        # if (state_dump_ticks is not None) and (done or cur_tick % state_dump_ticks == 0) and cur_tick != 0 and dist.get_rank() == 0:
+        #     torch.save(dict(net=lambda_net, optimizer_state=optimizer.state_dict()), os.path.join(run_dir, f'training-state-{cur_nimg//1000:06d}.pt'))
 
         # Update logs.
         training_stats.default_collector.update()
@@ -220,7 +228,7 @@ def training_loop(
         cur_tick += 1
         tick_start_nimg = cur_nimg
         tick_start_time = time.time()
-        init_time = tick_start_time - tick_end_time
+        maintain_time = tick_start_time - tick_end_time
         if done:
             break
 

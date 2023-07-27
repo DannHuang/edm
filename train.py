@@ -111,7 +111,7 @@ def main(**kwargs):
         # print(f'res={dataset_obj.resolution}, num_channels={dataset_obj.num_channels}, label dim={dataset_obj.label_dim}')
         c.dataset_kwargs.max_size = len(dataset_obj) # be explicit about dataset size
         if opts.cond and not dataset_obj.has_labels:
-            raise click.ClickException('--cond=True requires labels specified in dataset.json')
+            raise click.ClickException("--cond=True requires labels specified in 'dataset.json'")
         del dataset_obj # conserve memory
     except IOError as err:
         raise click.ClickException(f'--data: {err}')
@@ -202,10 +202,10 @@ def main(**kwargs):
         prev_run_ids = [int(x.group()) for x in prev_run_ids if x is not None]
         cur_run_id = max(prev_run_ids, default=-1) + 1
         c.run_dir = os.path.join(opts.outdir, f'{cur_run_id:05d}-{desc}')
-        c.dm_length = opts.dm_length
-        c.network_dir = opts.pretrain
         assert not os.path.exists(c.run_dir)
-
+    c.dm_length = opts.dm_length
+    c.network_dir = opts.pretrain
+    
     # Print options.
     dist.print0()
     dist.print0('Training options:')
@@ -220,7 +220,7 @@ def main(**kwargs):
     dist.print0(f'Batch size:              {c.batch_size}')
     dist.print0(f'Mixed-precision:         {c.network_kwargs.use_fp16}')
     dist.print0()
-
+    
     # Dry run?
     if opts.dry_run:
         dist.print0('Dry run; exiting.')
@@ -233,7 +233,6 @@ def main(**kwargs):
         with open(os.path.join(c.run_dir, 'training_options.json'), 'wt') as f:
             json.dump(c, f, indent=2)
         dnnlib.util.Logger(file_name=os.path.join(c.run_dir, 'log.txt'), file_mode='a', should_flush=True)
-
     # Train.
     sigma_training_loop.training_loop(**c)
 

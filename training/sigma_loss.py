@@ -37,22 +37,30 @@ class VPLoss:
 
 @persistence.persistent_class
 class VELoss:
-    def __init__(self, sigma_min=0.02, sigma_max=80.0):
-        self.sigma_min = sigma_min
-        self.sigma_max = sigma_max
+    def __init__(self, sigma_min=0.002, sigma_max=80.0):
+        self.sigma_min = torch.tensor(sigma_min, dtype=torch.float32)
+        self.sigma_max = torch.tensor(sigma_max, dtype=torch.float32)
 
-    def __call__(self, lambdas, diffusion_net, images, labels, augment_pipe=None):
-        sigmas=lambdas()
-        print(sigmas)
-        length=sigmas.shape[0]
-        rnd_index = torch.randint(length+1, [1], device=images.device)
-        # images.shape[0]
-        sigma = self.sigma_max * torch.prod(sigmas[rnd_index:]) if rnd_index<length else torch.tensor(self.sigma_max, dtype=torch.float32, device=images.device)
-        weight = 1/sigmas[rnd_index-1]-1 if rnd_index>0 else 1
+    def __call__(self, lambda_net, diffusion_net, images, labels, augment_pipe=None):
+        lambdas=lambda_net()
+        ratio=torch.cat([torch.ones_like(lambdas[:1])*self.sigma_max, lambdas])
+        sigmas=torch.cumprod(ratio, dim=0)
+        # FIXME: how to guarantee sigmas[-1] > sigma_min? maybe softmax instead of sigmoid.
+        # # in this case the sigma function we be addtivie instead of productive.
+        last_ratio=torch.ones_like(lambdas[:1])*self.sigma_min/sigmas[-1]
+        weights=torch.cat([lambdas, last_ratio])
+        dm_length=lambdas.shape[0]
+        batch_size=images.shape[0]
+        rnd_index = torch.randint(dm_length+1, [batch_size,1,1,1], device=images.device)
+        # reg_index = torch.ones([1,1,1,1], device=images.device, dtype=rnd_index.dtype)*dm_length
+        # rnd_index = torch.cat([rnd_index, reg_index], dim=0)
+        sigma = sigmas[rnd_index]
+        weight = 1/weights[rnd_index]-1
         y, augment_labels = augment_pipe(images) if augment_pipe is not None else (images, None)
         n = torch.randn_like(y) * sigma
         D_yn = diffusion_net(y + n, sigma, labels, augment_labels=augment_labels)
-        loss = weight * ((D_yn - y) ** 2)
+        loss = weight * ((D_yn - y).pow(2).sum())
+        # print(f'loss at {sigma[batch_size-1].item():.3f}={loss[batch_size-1,0,0,0].item():.2f}')
         return loss
 
 #----------------------------------------------------------------------------
