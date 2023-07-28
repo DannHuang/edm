@@ -73,7 +73,7 @@ def training_loop(
     if batch_gpu is None or batch_gpu > batch_gpu_total:
         batch_gpu = batch_gpu_total                             # batch_gpu <= batch_gpu_total
     num_accumulation_rounds = batch_gpu_total // batch_gpu      # allow for accumulated size larger than batch size
-    assert batch_size == batch_gpu * num_accumulation_rounds * dist.get_world_size()    # check total batch size
+    assert batch_size == batch_gpu * num_accumulation_rounds * dist.get_world_size(), 'batch size Error: cannot be allocated evenly to GPUs'    # check total batch size
 
     # Load dataset.
     dist.print0('Loading dataset...')
@@ -103,7 +103,7 @@ def training_loop(
     augment_pipe = dnnlib.util.construct_class_by_name(**augment_kwargs) if augment_kwargs is not None else None # training.augment.AugmentPipe
     # ddp = torch.nn.parallel.DistributedDataParallel(net, device_ids=[device], broadcast_buffers=False)
     # ddp = torch.nn.parallel.DistributedDataParallel(lambdas, device_ids=[device], broadcast_buffers=False)
-    # ema = copy.deepcopy(net).eval().requires_grad_(False)
+    ema = copy.deepcopy(lambda_net).eval().requires_grad_(False)
 
     # Resume training from previous snapshot.
     # if resume_pkl is not None:
@@ -148,7 +148,7 @@ def training_loop(
             loss=loss.sum().mul(loss_scaling / batch_gpu_total)
             loss.backward()
 
-        # Update weights.
+        # # Update weights.
         # for g in optimizer.param_groups:
             # g['lr'] = optimizer_kwargs['lr'] * min(cur_nimg / max(lr_rampup_kimg * 1000, 1e-8), 1)
             # print(g['lr'])
@@ -156,13 +156,14 @@ def training_loop(
             if param.grad is not None:
                 torch.nan_to_num(param.grad, nan=0, posinf=1e5, neginf=-1e5, out=param.grad)
         optimizer.step()
-        # Update EMA.
-        # ema_halflife_nimg = ema_halflife_kimg * 1000
-        # if ema_rampup_ratio is not None:
-        #     ema_halflife_nimg = min(ema_halflife_nimg, cur_nimg * ema_rampup_ratio)
-        # ema_beta = 0.5 ** (batch_size / max(ema_halflife_nimg, 1e-8))
-        # for p_ema, p_net in zip(ema.parameters(), net.parameters()):
-        #     p_ema.copy_(p_net.detach().lerp(p_ema, ema_beta))
+
+        # # Update EMA.
+        ema_halflife_nimg = ema_halflife_kimg * 1000
+        if ema_rampup_ratio is not None:
+            ema_halflife_nimg = min(ema_halflife_nimg, cur_nimg * ema_rampup_ratio)
+        ema_beta = 0.5 ** (batch_size / max(ema_halflife_nimg, 1e-8))
+        for p_ema, p_net in zip(ema.parameters(), lambda_net.parameters()):
+            p_ema.copy_(p_net.detach().lerp(p_ema, ema_beta))
 
         # Perform maintenance tasks once per tick.
         cur_nimg += batch_size
@@ -198,31 +199,36 @@ def training_loop(
             dist.print0('Aborting...')
 
         # Save network snapshot.
-        # if (snapshot_ticks is not None) and (done or cur_tick % snapshot_ticks == 0):
-        #     data = dict(ema=ema, loss_fn=loss_fn, augment_pipe=augment_pipe, dataset_kwargs=dict(dataset_kwargs))
-        #     for key, value in data.items():
-        #         if isinstance(value, torch.nn.Module):
-        #             value = copy.deepcopy(value).eval().requires_grad_(False)
-        #             misc.check_ddp_consistency(value)
-        #             data[key] = value.cpu()
-        #         del value # conserve memory
-        #     if dist.get_rank() == 0:
-        #         with open(os.path.join(run_dir, f'network-snapshot-{cur_nimg//1000:06d}.pkl'), 'wb') as f:
-        #             pickle.dump(data, f)
-        #     del data # conserve memory
+        if (snapshot_ticks is not None) and (done or cur_tick % snapshot_ticks == 0):
+            # data = dict(ema=ema, loss_fn=loss_fn, augment_pipe=augment_pipe, dataset_kwargs=dict(dataset_kwargs))
+            # for key, value in data.items():
+            #     if isinstance(value, torch.nn.Module):
+            #         value = copy.deepcopy(value).eval().requires_grad_(False)
+            #         misc.check_ddp_consistency(value)
+            #         data[key] = value.cpu()
+            #     del value # conserve memory
+            if dist.get_rank() == 0:
+                lambdas=ema()
+                ratio=torch.cat([torch.ones_like(lambdas[:1], requires_grad=False)*80.0, lambdas])
+                sigmas=torch.cumprod(ratio, dim=0).tolist()
+                with open(os.path.join(run_dir, 'sigmas-snapshot.txt'), 'a') as f:
+                    f.write(f'{cur_nimg//1000:06d} sigmas: ')
+                    f.write(sigmas)
+                    f.write('\n')
+            # del data # conserve memory
 
         # Save full dump of the training state.
         # if (state_dump_ticks is not None) and (done or cur_tick % state_dump_ticks == 0) and cur_tick != 0 and dist.get_rank() == 0:
         #     torch.save(dict(net=lambda_net, optimizer_state=optimizer.state_dict()), os.path.join(run_dir, f'training-state-{cur_nimg//1000:06d}.pt'))
 
         # Update logs.
-        training_stats.default_collector.update()
-        if dist.get_rank() == 0:
-            if stats_jsonl is None:
-                stats_jsonl = open(os.path.join(run_dir, 'stats.jsonl'), 'at')
-            stats_jsonl.write(json.dumps(dict(training_stats.default_collector.as_dict(), timestamp=time.time())) + '\n')
-            stats_jsonl.flush()
-        dist.update_progress(cur_nimg // 1000, total_kimg)
+        # training_stats.default_collector.update()
+        # if dist.get_rank() == 0:
+        #     if stats_jsonl is None:
+        #         stats_jsonl = open(os.path.join(run_dir, 'stats.jsonl'), 'at')
+        #     stats_jsonl.write(json.dumps(dict(training_stats.default_collector.as_dict(), timestamp=time.time())) + '\n')
+        #     stats_jsonl.flush()
+        # dist.update_progress(cur_nimg // 1000, total_kimg)
 
         # Update state.
         cur_tick += 1

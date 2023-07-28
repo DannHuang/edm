@@ -47,19 +47,28 @@ class VELoss:
         sigmas=torch.cumprod(ratio, dim=0)
         # FIXME: how to guarantee sigmas[-1] > sigma_min? maybe softmax instead of sigmoid.
         # # in this case the sigma function we be addtivie instead of productive.
-        last_ratio=torch.ones_like(lambdas[:1])*self.sigma_min/sigmas[-1]
-        weights=torch.cat([lambdas, last_ratio])
+
+        # # epsilon weights
+        # last_ratio=torch.ones_like(lambdas[:1])*self.sigma_min/sigmas[-1]
+        # weights=torch.cat([lambdas, last_ratio])
+        # weights=1/weights-1
+
+        # # denoised weights
+        sigmas_next = torch.cat([sigmas[1:], torch.ones_like(lambdas[:1])*self.sigma_min])
+        weights=1/sigmas_next-1/sigmas
         dm_length=lambdas.shape[0]
         batch_size=images.shape[0]
+        # rnd_index = torch.ones(dm_length+1, dtype=torch.int64, device=images.device).view(-1,1,1,1)*dm_length
         rnd_index = torch.randint(dm_length+1, [batch_size,1,1,1], device=images.device)
         # reg_index = torch.ones([1,1,1,1], device=images.device, dtype=rnd_index.dtype)*dm_length
         # rnd_index = torch.cat([rnd_index, reg_index], dim=0)
         sigma = sigmas[rnd_index]
-        weight = 1/weights[rnd_index]-1
+        weight = weights[rnd_index]
         y, augment_labels = augment_pipe(images) if augment_pipe is not None else (images, None)
         n = torch.randn_like(y) * sigma
         D_yn = diffusion_net(y + n, sigma, labels, augment_labels=augment_labels)
         loss = weight * ((D_yn - y).pow(2).sum())
+        # print(f'loss at each step: {((D_yn - y).pow(2).sum()/batch_size).tolist()}')
         # print(f'loss at {sigma[batch_size-1].item():.3f}={loss[batch_size-1,0,0,0].item():.2f}')
         return loss
 

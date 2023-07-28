@@ -155,7 +155,7 @@ def main(**kwargs):
 
     # Training options.
     c.total_kimg = max(int(opts.duration * 1000), 1)
-    c.ema_halflife_kimg = int(opts.ema * 1000)
+    c.ema_halflife_kimg = int(opts.ema*1000)
     c.update(batch_size=opts.batch, batch_gpu=opts.batch_gpu)
     c.update(loss_scaling=opts.ls, cudnn_benchmark=opts.bench)
     c.update(kimg_per_tick=opts.tick, snapshot_ticks=opts.snap, state_dump_ticks=opts.dump)
@@ -220,7 +220,7 @@ def main(**kwargs):
     dist.print0(f'Batch size:              {c.batch_size}')
     dist.print0(f'Mixed-precision:         {c.network_kwargs.use_fp16}')
     dist.print0()
-    
+
     # Dry run?
     if opts.dry_run:
         dist.print0('Dry run; exiting.')
