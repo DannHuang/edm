@@ -73,6 +73,6 @@ python fid.py calc --images=imgSamples --ref=https://nvlabs-fi-cdn.nvidia.com/ed
 
 Note that the numerical value of FID varies across different random seeds and is highly sensitive to the number of images. By default, `fid.py` will always use 50,000 generated images; providing fewer images will result in an error, whereas providing more will use a random subset. To reduce the effect of random variation, we recommend repeating the calculation multiple times with different seeds, e.g., `--seeds=0-49999`, `--seeds=50000-99999`, and `--seeds=100000-149999`. In our paper, we calculated each FID three times and reported the minimum.
 
-python train.py --outdir=/root/autodl-tmp/imgnet --data=/root/autodl-tmp/ImageNet --cond=1 --arch=adm --precond=sigma --duration=5 --batch=1024 --batch-gpu=32 --lr=1e-2 --ema=0.01 --dropout=0.10 --augment=0 --fp16=1 --ls=1 --tick=5 --snap=2 --dm_length=10 --pretrain=https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-imagenet-64x64-cond-adm.pkl
+python train.py --outdir=/root/autodl-tmp/imgnet --data=/root/autodl-tmp/ImageNet --cond=1 --duration=1 --batch=1000 --batch-gpu=50 --lr=1e-2 --ema=0.01 --augment=0 --ls=1 --tick=10 --snap=5 --pretrain=https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-imagenet-64x64-cond-adm.pkl --sigma-precond=Dns --sigma-arch=softmax --dm-length=15 -s
 
 python dataset_tool.py --source=/root/autodl-tmp/ImageNet --dest=/root/autodl-tmp/imagenet-64x64.zip --resolution=64x64 --transform=center-crop

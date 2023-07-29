@@ -10,25 +10,38 @@ from torch_utils import persistence
 # Differential Equations".
 
 @persistence.persistent_class
-class VPLoss:
-    def __init__(self, beta_d=19.9, beta_min=0.1, epsilon_t=1e-5):
-        self.beta_d = beta_d
-        self.beta_min = beta_min
-        self.epsilon_t = epsilon_t
+class SoftmaxLoss:
+    def __init__(self, sigma_min=0.002, sigma_max=80.0, mode='Dns'):
+        self.sigma_min = torch.tensor(sigma_min, dtype=torch.float32)
+        self.sigma_max = torch.tensor(sigma_max, dtype=torch.float32)
+        self.mode=mode
 
-    def __call__(self, net, images, labels, augment_pipe=None):
-        rnd_uniform = torch.rand([images.shape[0], 1, 1, 1], device=images.device)
-        sigma = self.sigma(1 + rnd_uniform * (self.epsilon_t - 1))
-        weight = 1 / sigma ** 2
+    def __call__(self, lambda_net, diffusion_net, images, labels, augment_pipe=None):
+        sigmas=lambda_net.sigmas(sigma_max=self.sigma_max, sigma_min=self.sigma_min)
+        dm_length=sigmas.shape[0] - 1
+        batch_size=images.shape[0]
+        sigmas_next=sigmas[1:]
+        sigmas=sigmas[:-1]
+        if self.mode=='Eps':
+            # epsilon weights
+            weights=sigmas_next/sigmas
+            weights=1/weights-1
+        else:
+            # # denoised weights
+            weights=1/sigmas_next-1/sigmas
+        rnd_index = torch.randint(dm_length, [batch_size,1,1,1], device=images.device)
+        # reg_index = torch.ones([1,1,1,1], device=images.device, dtype=rnd_index.dtype)*dm_length
+        # rnd_index = torch.cat([rnd_index, reg_index], dim=0)
+        sigma = sigmas[rnd_index]
+        weight = weights[rnd_index]
         y, augment_labels = augment_pipe(images) if augment_pipe is not None else (images, None)
         n = torch.randn_like(y) * sigma
-        D_yn = net(y + n, sigma, labels, augment_labels=augment_labels)
-        loss = weight * ((D_yn - y) ** 2)
+        D_yn = diffusion_net(y + n, sigma, labels, augment_labels=augment_labels)
+        loss = weight * ((D_yn - y).pow(2))
+        # print(f'loss at each step: {((D_yn - y).pow(2).sum()/batch_size).tolist()}')
+        # print(f'loss at {sigma[batch_size-1].item():.3f}={loss[batch_size-1,0,0,0].item():.2f}')
         return loss
-
-    def sigma(self, t):
-        t = torch.as_tensor(t)
-        return ((0.5 * self.beta_d * (t ** 2) + self.beta_min * t).exp() - 1).sqrt()
+    
 
 #----------------------------------------------------------------------------
 # lambdas define the sigma ratio, lambdas[i]=sigmas[i]/sigmas[i+1], sigmas[T]=sigma_max
@@ -36,29 +49,28 @@ class VPLoss:
 # 
 
 @persistence.persistent_class
-class VELoss:
-    def __init__(self, sigma_min=0.002, sigma_max=80.0):
+class SigmoidLoss:
+    def __init__(self, sigma_min=0.002, sigma_max=80.0, mode='Dns'):
         self.sigma_min = torch.tensor(sigma_min, dtype=torch.float32)
         self.sigma_max = torch.tensor(sigma_max, dtype=torch.float32)
+        self.mode = mode
 
     def __call__(self, lambda_net, diffusion_net, images, labels, augment_pipe=None):
         lambdas=lambda_net()
+        # # Sigmoid model
         ratio=torch.cat([torch.ones_like(lambdas[:1])*self.sigma_max, lambdas])
         sigmas=torch.cumprod(ratio, dim=0)
-        # FIXME: how to guarantee sigmas[-1] > sigma_min? maybe softmax instead of sigmoid.
-        # # in this case the sigma function we be addtivie instead of productive.
-
-        # # epsilon weights
-        # last_ratio=torch.ones_like(lambdas[:1])*self.sigma_min/sigmas[-1]
-        # weights=torch.cat([lambdas, last_ratio])
-        # weights=1/weights-1
-
-        # # denoised weights
-        sigmas_next = torch.cat([sigmas[1:], torch.ones_like(lambdas[:1])*self.sigma_min])
-        weights=1/sigmas_next-1/sigmas
         dm_length=lambdas.shape[0]
         batch_size=images.shape[0]
-        # rnd_index = torch.ones(dm_length+1, dtype=torch.int64, device=images.device).view(-1,1,1,1)*dm_length
+        if self.mode=='Eps':
+            # epsilon weights
+            last_ratio=torch.ones_like(lambdas[:1])*self.sigma_min/sigmas[-1]
+            weights=torch.cat([lambdas, last_ratio])
+            weights=1/weights-1
+        else:
+            # denoised weights
+            sigmas_next = torch.cat([sigmas[1:], torch.ones_like(lambdas[:1])*self.sigma_min])
+            weights=1/sigmas_next-1/sigmas
         rnd_index = torch.randint(dm_length+1, [batch_size,1,1,1], device=images.device)
         # reg_index = torch.ones([1,1,1,1], device=images.device, dtype=rnd_index.dtype)*dm_length
         # rnd_index = torch.cat([rnd_index, reg_index], dim=0)
@@ -67,7 +79,7 @@ class VELoss:
         y, augment_labels = augment_pipe(images) if augment_pipe is not None else (images, None)
         n = torch.randn_like(y) * sigma
         D_yn = diffusion_net(y + n, sigma, labels, augment_labels=augment_labels)
-        loss = weight * ((D_yn - y).pow(2).sum())
+        loss = weight * ((D_yn - y).pow(2)) + 1/(self.sigma_min-sigmas[-1])
         # print(f'loss at each step: {((D_yn - y).pow(2).sum()/batch_size).tolist()}')
         # print(f'loss at {sigma[batch_size-1].item():.3f}={loss[batch_size-1,0,0,0].item():.2f}')
         return loss

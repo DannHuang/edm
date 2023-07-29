@@ -46,8 +46,14 @@ def parse_int_list(s):
 @click.option('--data',          help='Path to the dataset', metavar='ZIP|DIR',                     type=str, required=True)
 @click.option('--cond',          help='Train class-conditional model', metavar='BOOL',              type=bool, default=False, show_default=True)
 @click.option('--arch',          help='Network architecture', metavar='ddpmpp|ncsnpp|adm',          type=click.Choice(['ddpmpp', 'ncsnpp', 'adm']), default='ddpmpp', show_default=True)
-@click.option('--precond',       help='Preconditioning & loss function', metavar='vp|ve|edm|sigma', type=click.Choice(['vp', 've', 'edm', 'sigma']), default='edm', show_default=True)
+@click.option('--precond',       help='Preconditioning & loss function', metavar='vp|ve|edm',       type=click.Choice(['vp', 've', 'edm']), default='edm', show_default=True)
 @click.option('--pretrain',      help='Pretrained DPM url', metavar='PKL|URL',                      type=str)
+
+# Tuning sigma
+@click.option('-s', '--sigma-learning', help='If learning sigma schedule',                          is_flag=True)
+@click.option('--sigma-arch',           help='sigma model arch', metavar='softmax|sigmoid',         type=click.Choice(['softmax', 'sigmoid']), default='softmax', show_default=True)
+@click.option('--sigma-precond',        help='Preconditioning of sigma loss', metavar='Eps|Dns',    type=click.Choice(['Eps', 'Dns']), default='Dns', show_default=True)
+@click.option('--dm-length',            help='sigma length', metavar='INT',                         type=click.IntRange(min=1), default=10, show_default=True)
 
 # Hyperparameters.
 @click.option('--duration',      help='Training duration', metavar='MIMG',                          type=click.FloatRange(min=0, min_open=True), default=200, show_default=True)
@@ -60,7 +66,6 @@ def parse_int_list(s):
 @click.option('--dropout',       help='Dropout probability', metavar='FLOAT',                       type=click.FloatRange(min=0, max=1), default=0.13, show_default=True)
 @click.option('--augment',       help='Augment probability', metavar='FLOAT',                       type=click.FloatRange(min=0, max=1), default=0.12, show_default=True)
 @click.option('--xflip',         help='Enable dataset x-flips', metavar='BOOL',                     type=bool, default=False, show_default=True)
-@click.option('--dm_length',     help='sigma length', metavar='INT',                                type=click.IntRange(min=1), default=10, show_default=True)
 
 # Performance-related.
 @click.option('--fp16',          help='Enable mixed-precision training', metavar='BOOL',            type=bool, default=False, show_default=True)
@@ -115,7 +120,7 @@ def main(**kwargs):
         del dataset_obj # conserve memory
     except IOError as err:
         raise click.ClickException(f'--data: {err}')
-    
+
     # Network architecture.
     if opts.arch == 'ddpmpp':
         c.network_kwargs.update(model_type='SongUNet', embedding_type='positional', encoder_type='standard', decoder_type='standard')
@@ -134,9 +139,6 @@ def main(**kwargs):
     elif opts.precond == 've':
         c.network_kwargs.class_name = 'training.networks.VEPrecond'
         c.loss_kwargs.class_name = 'training.loss.VELoss'
-    elif opts.precond == 'sigma':
-        c.network_kwargs.class_name = 'training.networks.EDMPrecond'
-        c.loss_kwargs.class_name = 'training.sigma_loss.VELoss'
     else:
         assert opts.precond == 'edm'    # DEFUALT
         c.network_kwargs.class_name = 'training.networks.EDMPrecond'
@@ -152,6 +154,20 @@ def main(**kwargs):
         c.augment_kwargs.update(xflip=1e8, yflip=1, scale=1, rotate_frac=1, aniso=1, translate_frac=1)
         c.network_kwargs.augment_dim = 9
     c.network_kwargs.update(dropout=opts.dropout, use_fp16=opts.fp16)
+
+    # Tuning sigma
+    if opts.sigma_learning:
+        c.network_kwargs = dnnlib.EasyDict()
+        c.loss_kwargs = dnnlib.EasyDict()
+        if opts.sigma_arch == 'softmax':
+            c.network_kwargs.class_name = 'training.sigma_training_loop.softmax_model'
+            c.loss_kwargs.class_name = 'training.sigma_loss.SoftmaxLoss'
+        else:
+            assert opts.sigma_arch=='sigmoid', 'not defined sigma model arch'
+            c.network_kwargs.class_name = 'training.sigma_training_loop.sigmoid_model'
+            c.loss_kwargs.class_name = 'training.sigma_loss.SigmoidLoss'
+        c.loss_kwargs.update(mode=opts.sigma_precond)    
+        c.network_kwargs.update(dm_length=opts.dm_length)
 
     # Training options.
     c.total_kimg = max(int(opts.duration * 1000), 1)
@@ -184,7 +200,7 @@ def main(**kwargs):
 
     # Description string.
     cond_str = 'cond' if c.dataset_kwargs.use_labels else 'uncond'
-    dtype_str = 'fp16' if c.network_kwargs.use_fp16 else 'fp32'
+    dtype_str = 'fp16' if opts.fp16 else 'fp32'
     desc = f'{dataset_name:s}-{cond_str:s}-{opts.arch:s}-{opts.precond:s}-gpus{dist.get_world_size():d}-batch{c.batch_size:d}-{dtype_str:s}'
     if opts.desc is not None:
         desc += f'-{opts.desc}'
@@ -203,7 +219,6 @@ def main(**kwargs):
         cur_run_id = max(prev_run_ids, default=-1) + 1
         c.run_dir = os.path.join(opts.outdir, f'{cur_run_id:05d}-{desc}')
         assert not os.path.exists(c.run_dir)
-    c.dm_length = opts.dm_length
     c.network_dir = opts.pretrain
     
     # Print options.
@@ -216,9 +231,10 @@ def main(**kwargs):
     dist.print0(f'Class-conditional:       {c.dataset_kwargs.use_labels}')
     dist.print0(f'Network architecture:    {opts.arch}')
     dist.print0(f'Preconditioning & loss:  {opts.precond}')
+    dist.print0(f'Diffusion Length         {opts.dm_length}')
     dist.print0(f'Number of GPUs:          {dist.get_world_size()}')
     dist.print0(f'Batch size:              {c.batch_size}')
-    dist.print0(f'Mixed-precision:         {c.network_kwargs.use_fp16}')
+    dist.print0(f'Mixed-precision:         {opts.fp16}')
     dist.print0()
 
     # Dry run?

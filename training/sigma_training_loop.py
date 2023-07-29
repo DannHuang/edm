@@ -23,14 +23,43 @@ from torch_utils import training_stats
 from torch_utils import misc
 
 #----------------------------------------------------------------------------
-class sigma_net(nn.Module):
-    def __init__(self, length=10):
+class sigmoid_model(nn.Module):
+    def __init__(self, dm_length=10):
         super().__init__()
-        self.length=length
-        self.vec=torch.nn.Parameter(torch.randn(length, dtype=torch.float32))
+        self.length=dm_length
+        self.init_vec=torch.randn(self.length, dtype=torch.float32)
+        # self.init_vec=torch.tensor([9.8277, 9.5160, 9.7185, 6.8753, 7.8725, 5.9169, 5.2962, 5.0081, 4.1049, 2.2808], dtype=torch.float32)
+        self.vec=torch.nn.Parameter(self.init_vec)
+
+    def forward(self):
+        # sigmoid model
+        return F.sigmoid(self.vec)
+    
+    def sigmas(self, sigma_max, sigma_min):
+        lambdas=self.forward()
+        ratio=torch.cat([torch.ones_like(lambdas[:1])*sigma_max, lambdas])
+        sigmas=torch.cumprod(ratio, dim=0)
+        sigmas=torch.cat([sigmas, torch.ones_like(lambdas[:1])*sigma_min])
+        return sigmas
+
+class softmax_model(nn.Module):
+    def __init__(self, dm_length=10) -> None:
+        super().__init__()
+        self.length=dm_length
+        self.init_vec=torch.randn(self.length, dtype=torch.float32)
+        self.vec=torch.nn.Parameter(self.init_vec)
     
     def forward(self):
-        return F.sigmoid(self.vec)
+        ph=torch.ones_like(self.init_vec[:1], dtype=torch.float32, device=self.vec.device)
+        v = torch.cat([self.vec, ph])
+        increment=F.softmax(v, dim=0)
+        return increment[:self.length]
+    
+    def sigmas(self, sigma_max, sigma_min):
+        lambdas=self.forward()
+        sigmas=torch.cumsum(lambdas, dim=0)*(sigma_min-sigma_max)+sigma_max
+        sigmas=torch.cat([torch.ones_like(lambdas[:1])*sigma_max, sigmas, torch.ones_like(lambdas[:1])*sigma_min])
+        return sigmas
 
 def training_loop(
     run_dir             = '.',      # Output directory.
@@ -86,7 +115,7 @@ def training_loop(
     with dnnlib.util.open_url(network_dir, verbose=True) as f:
         net = pickle.load(f)['ema'].to(device)
     net.eval().requires_grad_(False).to(device)
-    lambda_net = sigma_net(dm_length)
+    lambda_net = dnnlib.util.construct_class_by_name(**network_kwargs)
     lambda_net.train().requires_grad_().to(device)
     if dist.get_rank() == 0:
         with torch.no_grad():
@@ -138,6 +167,7 @@ def training_loop(
 
         # Accumulate gradients.
         optimizer.zero_grad()
+        total_loss=0
         for round_idx in range(num_accumulation_rounds):
         #     with misc.ddp_sync(ddp, (round_idx == num_accumulation_rounds - 1)):
             images, labels = next(dataset_iterator)
@@ -146,6 +176,7 @@ def training_loop(
             loss = loss_fn(lambda_net=lambda_net, diffusion_net=net, images=images, labels=labels, augment_pipe=None)
             training_stats.report('Loss/loss', loss)
             loss=loss.sum().mul(loss_scaling / batch_gpu_total)
+            total_loss+=loss
             loss.backward()
 
         # # Update weights.
@@ -186,11 +217,9 @@ def training_loop(
         torch.cuda.reset_peak_memory_stats()
         dist.print0(' '.join(fields))
         with torch.no_grad():
-            lambdas=lambda_net()
-            ratio=torch.cat([torch.ones_like(lambdas[:1], requires_grad=False)*80.0, lambdas])
-            sigmas=torch.cumprod(ratio, dim=0)
+            sigmas=lambda_net.sigmas(sigma_max=80.0, sigma_min=0.002)
         sigmas=[f'{s:.3f}'for s in sigmas]
-        dist.print0(f'loss={loss}, sigmas={sigmas}')
+        dist.print0(f'loss={total_loss:.2f}, sigmas={sigmas}')
 
         # Check for abort.
         if (not done) and dist.should_stop():
@@ -208,12 +237,10 @@ def training_loop(
             #         data[key] = value.cpu()
             #     del value # conserve memory
             if dist.get_rank() == 0:
-                lambdas=ema()
-                ratio=torch.cat([torch.ones_like(lambdas[:1], requires_grad=False)*80.0, lambdas])
-                sigmas=torch.cumprod(ratio, dim=0).tolist()
+                sigmas=ema.sigmas(sigma_max=80.0, sigma_min=0.002)
                 with open(os.path.join(run_dir, 'sigmas-snapshot.txt'), 'a') as f:
                     f.write(f'{cur_nimg//1000:06d} sigmas: ')
-                    f.write(sigmas)
+                    f.write(str(sigmas))
                     f.write('\n')
             # del data # conserve memory
 
@@ -236,6 +263,9 @@ def training_loop(
         tick_start_time = time.time()
         maintain_time = tick_start_time - tick_end_time
         if done:
+            with open(os.path.join(run_dir, 'sigmas-snapshot.txt'), 'a') as f:
+                for p in ema.parameters():
+                    f.write(str(p))
             break
 
     # Done.
