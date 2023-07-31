@@ -161,10 +161,16 @@ def main(**kwargs):
         c.loss_kwargs = dnnlib.EasyDict()
         if opts.sigma_arch == 'softmax':
             c.network_kwargs.class_name = 'training.sigma_training_loop.softmax_model'
+            # c.network_kwargs.sigma_max = opts.sigma_max
+            # c.network_kwargs.sigma_min = opts.sigma_min
+            # c.network_kwargs.rho = opts.rho
             c.loss_kwargs.class_name = 'training.sigma_loss.SoftmaxLoss'
         else:
             assert opts.sigma_arch=='sigmoid', 'not defined sigma model arch'
             c.network_kwargs.class_name = 'training.sigma_training_loop.sigmoid_model'
+            # c.network_kwargs.sigma_max = opts.sigma_max
+            # c.network_kwargs.sigma_min = opts.sigma_min
+            # c.network_kwargs.rho = opts.rho
             c.loss_kwargs.class_name = 'training.sigma_loss.SigmoidLoss'
         c.loss_kwargs.update(mode=opts.sigma_precond)    
         c.network_kwargs.update(dm_length=opts.dm_length)
@@ -201,7 +207,7 @@ def main(**kwargs):
     # Description string.
     cond_str = 'cond' if c.dataset_kwargs.use_labels else 'uncond'
     dtype_str = 'fp16' if opts.fp16 else 'fp32'
-    desc = f'{dataset_name:s}-{cond_str:s}-{opts.arch:s}-{opts.precond:s}-gpus{dist.get_world_size():d}-batch{c.batch_size:d}-{dtype_str:s}'
+    desc = f'{dataset_name:s}-{cond_str:s}-{opts.sigma_arch:s}-{opts.sigma_precond:s}-gpus{dist.get_world_size():d}-batch{c.batch_size:d}-{dtype_str:s}'
     if opts.desc is not None:
         desc += f'-{opts.desc}'
 

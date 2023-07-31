@@ -24,10 +24,24 @@ from torch_utils import misc
 
 #----------------------------------------------------------------------------
 class sigmoid_model(nn.Module):
-    def __init__(self, dm_length=10):
+    def __init__(self, dm_length=10, sigma_max=80.0, sigma_min=0.002, rho=3.0):
         super().__init__()
         self.length=dm_length
-        self.init_vec=torch.randn(self.length, dtype=torch.float32)
+        self.sigma_max=sigma_max
+        self.sigma_min=sigma_min
+        self.rho=rho
+        A = torch.tensor(self.sigma_max**(1/self.rho), dtype=torch.float64)
+        B = torch.tensor(self.sigma_min**(1/self.rho) - self.sigma_max**(1/self.rho), dtype=torch.float64)
+        # # Time step discretization, turn time-steps into sigma-schedule.
+        step_indices = torch.arange(self.length, dtype=torch.float64)  # [0,1,...,num_steps-1]
+        sigmas = (A + step_indices/(self.length-1)*B).pow(self.rho)
+        ratio = sigmas[1:]/sigmas[:-1]
+        logits=-(1/ratio-1).log()
+        # # EDM init
+        self.init_vec=logits
+        # # Random init
+        # self.init_vec=torch.randn(self.length, dtype=torch.float64)
+        # # Resume previous
         # self.init_vec=torch.tensor([9.8277, 9.5160, 9.7185, 6.8753, 7.8725, 5.9169, 5.2962, 5.0081, 4.1049, 2.2808], dtype=torch.float32)
         self.vec=torch.nn.Parameter(self.init_vec)
 
@@ -35,30 +49,51 @@ class sigmoid_model(nn.Module):
         # sigmoid model
         return F.sigmoid(self.vec)
     
-    def sigmas(self, sigma_max, sigma_min):
+    def sigmas(self):
         lambdas=self.forward()
-        ratio=torch.cat([torch.ones_like(lambdas[:1])*sigma_max, lambdas])
+        ratio=torch.cat([torch.ones_like(lambdas[:1])*self.sigma_max, lambdas])
         sigmas=torch.cumprod(ratio, dim=0)
-        sigmas=torch.cat([sigmas, torch.ones_like(lambdas[:1])*sigma_min])
+        # sigmas=torch.cat([sigmas, torch.ones_like(lambdas[:1])*sigma_min])
         return sigmas
 
 class softmax_model(nn.Module):
-    def __init__(self, dm_length=10) -> None:
+    def __init__(self, dm_length=10, sigma_max=80.0, sigma_min=0.002, rho=3.0):
         super().__init__()
-        self.length=dm_length
-        self.init_vec=torch.randn(self.length, dtype=torch.float32)
+        self.length=dm_length-2
+        self.sigma_max=sigma_max
+        self.sigma_min=sigma_min
+        self.rho=rho
+        A = torch.tensor(self.sigma_max**(1/self.rho), dtype=torch.float64)
+        B = torch.tensor(self.sigma_min**(1/self.rho) - self.sigma_max**(1/self.rho), dtype=torch.float64)
+        # # Time step discretization, turn time-steps into sigma-schedule.
+        step_indices = torch.arange(dm_length, dtype=torch.float64)  # [0,1,...,num_steps-1]
+        sigmas = (A + step_indices/(dm_length-1)*B).pow(self.rho)
+        ratio = (sigmas[1:]-sigmas[:-1])/(sigma_min-sigma_max)
+        logits=ratio.log()
+        c=1-logits[-1]
+        logits=logits+c
+        self.init_vec=logits[:-1]
+        # # Random init
+        # self.init_vec=torch.randn(self.length, dtype=torch.float64)
+        # # Resume previous
+        # self.init_vec=torch.tensor([13.9053, 12.4946, 11.6138, 11.3109, 11.3066, 10.4056, 10.1062, 10.0252,
+        #  9.9265,  9.4689,  9.3377,  8.4978,  8.4505,  8.5741,  8.2184,  7.8147,
+        #  8.0148,  7.6851,  7.5641,  7.4591,  7.0903,  6.9518,  7.0726,  6.6815,
+        #  6.3316,  6.2892,  5.9725,  6.0144,  5.7710,  5.5893,  5.3469,  5.2438,
+        #  5.1350,  4.9320,  4.6835,  4.5535,  4.2176,  3.8566,  3.6656,  3.3114,
+        #  1.0000], dtype=torch.float64)
         self.vec=torch.nn.Parameter(self.init_vec)
     
     def forward(self):
-        ph=torch.ones_like(self.init_vec[:1], dtype=torch.float32, device=self.vec.device)
+        ph=torch.ones_like(self.init_vec[:1], dtype=torch.float64, device=self.vec.device)
         v = torch.cat([self.vec, ph])
         increment=F.softmax(v, dim=0)
         return increment[:self.length]
     
-    def sigmas(self, sigma_max, sigma_min):
+    def sigmas(self):
         lambdas=self.forward()
-        sigmas=torch.cumsum(lambdas, dim=0)*(sigma_min-sigma_max)+sigma_max
-        sigmas=torch.cat([torch.ones_like(lambdas[:1])*sigma_max, sigmas, torch.ones_like(lambdas[:1])*sigma_min])
+        sigmas=torch.cumsum(lambdas, dim=0)*(self.sigma_min-self.sigma_max)+self.sigma_max
+        sigmas=torch.cat([torch.ones_like(lambdas[:1])*self.sigma_max, sigmas, torch.ones_like(lambdas[:1])*self.sigma_min])
         return sigmas
 
 def training_loop(
@@ -67,7 +102,6 @@ def training_loop(
     dataset_kwargs      = {},       # Options for training set.
     data_loader_kwargs  = {},       # Options for torch.utils.data.DataLoader.
     network_kwargs      = {},       # Options for model and preconditioning.
-    dm_length = 10,
     loss_kwargs         = {},       # Options for loss function.
     optimizer_kwargs    = {},       # Options for optimizer.
     augment_kwargs      = None,     # Options for augmentation pipeline, None = disable.
@@ -168,15 +202,22 @@ def training_loop(
         # Accumulate gradients.
         optimizer.zero_grad()
         total_loss=0
+        total_regu=0
         for round_idx in range(num_accumulation_rounds):
         #     with misc.ddp_sync(ddp, (round_idx == num_accumulation_rounds - 1)):
             images, labels = next(dataset_iterator)
             images = images.to(device).to(torch.float32) / 127.5 - 1
             labels = labels.to(device)
             loss = loss_fn(lambda_net=lambda_net, diffusion_net=net, images=images, labels=labels, augment_pipe=None)
+            if len(loss)==1:
+                loss=loss[0]
+            else:
+                regu=loss[1].sum().mul(loss_scaling / batch_gpu_total)
+                loss=loss[0]
             training_stats.report('Loss/loss', loss)
             loss=loss.sum().mul(loss_scaling / batch_gpu_total)
             total_loss+=loss
+            total_regu+=regu
             loss.backward()
 
         # # Update weights.
@@ -217,9 +258,9 @@ def training_loop(
         torch.cuda.reset_peak_memory_stats()
         dist.print0(' '.join(fields))
         with torch.no_grad():
-            sigmas=lambda_net.sigmas(sigma_max=80.0, sigma_min=0.002)
+            sigmas=lambda_net.sigmas()
         sigmas=[f'{s:.3f}'for s in sigmas]
-        dist.print0(f'loss={total_loss:.2f}, sigmas={sigmas}')
+        dist.print0(f'loss={total_loss:.2f} | regu={total_regu:.2f} | sigmas={sigmas}')
 
         # Check for abort.
         if (not done) and dist.should_stop():
@@ -237,16 +278,12 @@ def training_loop(
             #         data[key] = value.cpu()
             #     del value # conserve memory
             if dist.get_rank() == 0:
-                sigmas=ema.sigmas(sigma_max=80.0, sigma_min=0.002)
+                sigmas=ema.sigmas()
                 with open(os.path.join(run_dir, 'sigmas-snapshot.txt'), 'a') as f:
                     f.write(f'{cur_nimg//1000:06d} sigmas: ')
                     f.write(str(sigmas))
                     f.write('\n')
             # del data # conserve memory
-
-        # Save full dump of the training state.
-        # if (state_dump_ticks is not None) and (done or cur_tick % state_dump_ticks == 0) and cur_tick != 0 and dist.get_rank() == 0:
-        #     torch.save(dict(net=lambda_net, optimizer_state=optimizer.state_dict()), os.path.join(run_dir, f'training-state-{cur_nimg//1000:06d}.pt'))
 
         # Update logs.
         # training_stats.default_collector.update()
@@ -263,9 +300,12 @@ def training_loop(
         tick_start_time = time.time()
         maintain_time = tick_start_time - tick_end_time
         if done:
-            with open(os.path.join(run_dir, 'sigmas-snapshot.txt'), 'a') as f:
-                for p in ema.parameters():
-                    f.write(str(p))
+            # # Save full dump of the training state.
+            if dist.get_rank() == 0:
+                torch.save(dict(net=lambda_net, optimizer_state=optimizer.state_dict()), os.path.join(run_dir, f'training-state.pt'))
+            # with open(os.path.join(run_dir, 'sigmas-snapshot.txt'), 'a') as f:
+            #     for p in ema.parameters():
+            #         f.write(str(p))
             break
 
     # Done.
