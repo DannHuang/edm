@@ -28,9 +28,8 @@ class SoftmaxLoss:
             summation_vec_next[i, index_next[i]] = 1
 
         summation_tensor = torch.stack((torch.from_numpy(summation_vec), torch.from_numpy(summation_vec_next)), dim=1)
-        sigmas = sigma_model(summation_tensor.to(images.device))  # batch of [cur_sigma, next_sigma]
+        sigmas = sigma_model(summation_tensor.to(images.device)).unsqueeze(-1).unsqueeze(-1)  # batch of [cur_sigma, next_sigma]
         cur_sigma, next_sigma = sigmas.chunk(2, dim = 1)    # [batch, 1]
-        print(cur_sigma, next_sigma)
         if self.mode == 'Dns':
             # denoised weights
             weights = 1 / next_sigma - 1 / cur_sigma
@@ -96,20 +95,39 @@ class SigmoidLoss:
 # of Diffusion-Based Generative Models" (EDM).
 
 @persistence.persistent_class
-class EDMLoss:
-    def __init__(self, P_mean=-1.2, P_std=1.2, sigma_data=0.5):
-        self.P_mean = P_mean
-        self.P_std = P_std
-        self.sigma_data = sigma_data
+class WrappedLoss:
+    def __init__(self, mode='Dns'):
+        self.mode=mode
 
-    def __call__(self, net, images, labels=None, augment_pipe=None):
-        rnd_normal = torch.randn([images.shape[0], 1, 1, 1], device=images.device)
-        sigma = (rnd_normal * self.P_std + self.P_mean).exp()
-        weight = (sigma ** 2 + self.sigma_data ** 2) / (sigma * self.sigma_data) ** 2
+    def __call__(self, finetune_model, images, labels, augment_pipe=None):
+        batch_size = images.shape[0]
+        dm_length = finetune_model.sigma_model.dm_length
+        t = np.random.randint(dm_length - 1, size=batch_size)   # length-1 increments
+        index = [[j for j in range(i)] for i in t]
+        summation_vec = np.zeros([batch_size, dm_length - 1])
+        index_next = [[j for j in range(i)] for i in t+1]
+        summation_vec_next = np.zeros([batch_size, dm_length - 1])
+        for i in range(batch_size):
+            summation_vec[i, index[i]] = 1
+            summation_vec_next[i, index_next[i]] = 1
+
+        summation_tensor = torch.stack((torch.from_numpy(summation_vec), torch.from_numpy(summation_vec_next)), dim=1).to(torch.float32)
+        sigmas = finetune_model.sigma_model(summation_tensor.to(images.device)).unsqueeze(-1).unsqueeze(-1)
+        cur_sigma, next_sigma = sigmas.chunk(2, dim = 1)    # [batch, 1]
+        if self.mode == 'Dns':
+            # denoised weights
+            weights = 1 / next_sigma - 1 / cur_sigma
+        else:
+            # epsilon weights
+            weights = next_sigma / cur_sigma
+            weights = 1 / weights - 1
+
+        # reg_index = torch.ones([1,1,1,1], device = images.device, dtype = rnd_index.dtype) * dm_length
+        # rnd_index = torch.cat([rnd_index, reg_index], dim=0)
         y, augment_labels = augment_pipe(images) if augment_pipe is not None else (images, None)
-        n = torch.randn_like(y) * sigma
-        D_yn = net(y + n, sigma, labels, augment_labels=augment_labels)
-        loss = weight * ((D_yn - y) ** 2)
+        n = torch.randn_like(y) * cur_sigma
+        D_yn = finetune_model.diffusion(y + n, cur_sigma, labels, augment_labels=augment_labels)
+        loss = weights * ((D_yn - y).pow(2))
         return loss
 
 #----------------------------------------------------------------------------

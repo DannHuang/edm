@@ -259,6 +259,7 @@ def sigma_training_loop(
         batch_gpu = batch_gpu_total
     num_accumulation_rounds = batch_gpu_total // batch_gpu      # allow for accumulated size larger than batch size
     assert batch_size == batch_gpu * num_accumulation_rounds * dist.get_world_size(), 'BatchsizeError: cannot be allocated evenly to GPUs'    # check total batch size
+    dist.print0(f"batch_gpu_total: {batch_gpu_total}, batch_gpu: {batch_gpu}, num_accumulation_rounds: {num_accumulation_rounds}")
 
     # Load dataset.
     dist.print0('Loading dataset...')
@@ -266,61 +267,39 @@ def sigma_training_loop(
     dataset_sampler = misc.InfiniteSampler(dataset=dataset_obj, rank=dist.get_rank(), num_replicas=dist.get_world_size(), seed=seed)
     dataset_iterator = iter(torch.utils.data.DataLoader(dataset=dataset_obj, sampler=dataset_sampler, batch_size=batch_gpu, **data_loader_kwargs))
 
-    # Construct Diffusion Model.
+    # Construct Finetune wrapper.
     dist.print0('Constructing diffusion models...')
     interface_kwargs = dict(img_resolution=dataset_obj.resolution, img_channels=dataset_obj.num_channels, label_dim=dataset_obj.label_dim)
-    net = dnnlib.util.construct_class_by_name(**network_kwargs, **interface_kwargs)
-    net.train().requires_grad_(True).to(device)
-
-    # # Construct Sigma Model.
-    sigma_model = dnnlib.util.construct_class_by_name(**sigma_network_kwargs)
-    sigma_model.train().requires_grad_(True).to(device)
-
+    net = finetune_wrapper(network_kwargs, interface_kwargs, sigma_network_kwargs)
+    net.to(device)
 
     # Dummy run.
     if dist.get_rank() == 0:
         with torch.no_grad():
-            t = np.array([i for i in range(sigma_model.dm_length)])
+            t = np.array([i for i in range(net.sigma_model.dm_length - 1)])
             index = [[j for j in range(i)] for i in t]
-            summation_vec = np.zeros([sigma_model.dm_length - 1, sigma_model.dm_length - 1])
+            summation_vec = np.zeros([net.sigma_model.dm_length - 1, net.sigma_model.dm_length - 1])
             index_next = [[j for j in range(i)] for i in t+1]
-            summation_vec_next = np.zeros([sigma_model.dm_length - 1, sigma_model.dm_length - 1])
-            for i in range(sigma_model.dm_length - 1):
+            summation_vec_next = np.zeros([net.sigma_model.dm_length - 1, net.sigma_model.dm_length - 1])
+            for i in range(net.sigma_model.dm_length - 1):
                 summation_vec[i, index[i]] = 1
                 summation_vec_next[i, index_next[i]] = 1
+            summation_tensor = torch.stack((torch.from_numpy(summation_vec), torch.from_numpy(summation_vec_next)), dim=1).to(torch.float32)
 
-            summation_tensor = torch.stack((torch.from_numpy(summation_vec), torch.from_numpy(summation_vec_next)), dim=1)
-            
-            images = torch.zeros([batch_gpu, net.img_channels, net.img_resolution, net.img_resolution], device=device)
-            sigma = sigma_model(summation_tensor.to(device))
+            images = torch.zeros([batch_gpu, net.diffusion.img_channels, net.diffusion.img_resolution, net.diffusion.img_resolution], device=device)
+            sigma = net.sigma_model(summation_tensor.to(device))
             cur_sigma, next_sigma = sigma.chunk(2, dim=1)
             dist.print0(f"sigma model init with {cur_sigma} and {next_sigma}")
-            labels = torch.zeros([batch_gpu, net.label_dim], device=device)
-            misc.print_module_summary(net, [images, cur_sigma[0], labels], max_nesting=2)
+            labels = torch.zeros([batch_gpu, net.diffusion.label_dim], device=device)
+            sum_tensor = torch.zeros([batch_gpu, 2, net.sigma_model.dm_length - 1], device=device)
+            misc.print_module_summary(net, [images, labels, sum_tensor], max_nesting=2)
 
     # Setup optimizer.
     dist.print0('Setting up optimizer...')
-    loss_fn = dnnlib.util.construct_class_by_name(**loss_kwargs)
-    # TODO: single optimizer
-    optimizer_dm = dnnlib.util.construct_class_by_name(params=net.parameters(), **optimizer_kwargs) # subclass of torch.optim.Optimizer
-    optimizer_sigma = dnnlib.util.construct_class_by_name(params=sigma_model.parameters(), **optimizer_kwargs)
+    optimizer = dnnlib.util.construct_class_by_name(params=net.parameters(), **optimizer_kwargs) # subclass of torch.optim.Optimizer
     augment_pipe = dnnlib.util.construct_class_by_name(**augment_kwargs) if augment_kwargs is not None else None # training.augment.AugmentPipe
-    ddp_dm = torch.nn.parallel.DistributedDataParallel(net, device_ids=[device])
-    ddp_sigma = torch.nn.parallel.DistributedDataParallel(sigma_model, device_ids=[device])
-    ema_dm = copy.deepcopy(net).eval().requires_grad_(False)
-    ema_simga = copy.deepcopy(sigma_model).eval().requires_grad_(False)
-
-    # Load pretrain models.
-    dist.print0(f'Loading network weights from "{pretrain_dm}"...')
-    if dist.get_rank() != 0:
-        torch.distributed.barrier() # rank 0 goes first
-    with dnnlib.util.open_url(pretrain_dm, verbose=(dist.get_rank() == 0)) as f:
-        data = pickle.load(f)
-    if dist.get_rank() == 0:
-        torch.distributed.barrier() # other ranks follow
-    misc.copy_params_and_buffers(src_module=data['ema'], dst_module=net, require_all=False)
-    misc.copy_params_and_buffers(src_module=data['ema'], dst_module=ema_dm, require_all=False)
-    del data # conserve memory
+    ddp = torch.nn.parallel.DistributedDataParallel(net, device_ids=[device])
+    ema = copy.deepcopy(net).eval().requires_grad_(False)
 
     # Resume training from previous snapshot. FIXME: not implement yet
     if resume_pkl is not None:
@@ -354,15 +333,14 @@ def sigma_training_loop(
     while True:
 
         # Accumulate gradients.
-        optimizer_dm.zero_grad()
-        optimizer_sigma.zero_grad()
+        optimizer.zero_grad()
         total_loss=0
         for round_idx in range(num_accumulation_rounds):
         #     with misc.ddp_sync(ddp, (round_idx == num_accumulation_rounds - 1)):
             images, labels = next(dataset_iterator)
             images = images.to(device).to(torch.float32) / 127.5 - 1
             labels = labels.to(device)
-            loss = loss_fn(sigma_model=sigma_model, diffusion_net=net, images=images, labels=labels, augment_pipe=None)
+            loss = net.get_loss(images=images, labels=labels, augment_pipe=augment_pipe)
             if isinstance(loss, tuple):
                 regu=loss[1].sum().mul(loss_scaling / batch_gpu_total)
                 loss=loss[0]
@@ -378,11 +356,7 @@ def sigma_training_loop(
         for param in net.parameters():
             if param.grad is not None:
                 torch.nan_to_num(param.grad, nan=0, posinf=1e5, neginf=-1e5, out=param.grad)
-        for param in sigma_model.parameters():
-            if param.grad is not None:
-                torch.nan_to_num(param.grad, nan=0, posinf=1e5, neginf=-1e5, out=param.grad)
-        optimizer_dm.step()
-        optimizer_sigma.step()
+        optimizer.step()
         continue
 
         # # Update EMA.
@@ -390,7 +364,7 @@ def sigma_training_loop(
         if ema_rampup_ratio is not None:
             ema_halflife_nimg = min(ema_halflife_nimg, cur_nimg * ema_rampup_ratio)
         ema_beta = 0.5 ** (batch_size / max(ema_halflife_nimg, 1e-8))
-        for p_ema, p_net in zip(ema.parameters(), lambda_net.parameters()):
+        for p_ema, p_net in zip(ema.parameters(), net.parameters()):    # TODO: ema on diffusion only
             p_ema.copy_(p_net.detach().lerp(p_ema, ema_beta))
 
         # Perform maintenance tasks once per tick.

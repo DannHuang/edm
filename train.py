@@ -210,6 +210,7 @@ def main(**kwargs):
     if opts.sigma_learning:
         assert opts.pretrain is not None, "Sigma learning requires a pretrained diffusion model"
         c.pretrain_dm = opts.pretrain
+        c.ema_rampup_ratio = None
     if opts.transfer is not None:
         raise NotImplementedError('Transfer learning is not supported')
         if opts.resume is not None:

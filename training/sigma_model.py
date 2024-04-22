@@ -1,7 +1,11 @@
 import dnnlib
 import torch
+import pickle
+import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
+from torch_utils import misc
+import torch_utils.distributed as dist
 
 class sigmoid_model(nn.Module):
     def __init__(self, dm_length=10, sigma_max=80.0, sigma_min=0.002, rho=3.0):
@@ -76,9 +80,9 @@ class softmax_model_batch(nn.Module):
         self.sigma_min = sigma_min
         if init == 'edm':
             self.rho = rho
-            self.init_shift = torch.tensor(self.sigma_max**(1/self.rho), dtype = torch.float64)
-            self.init_scale = torch.tensor(self.sigma_min**(1/self.rho) - self.sigma_max**(1/self.rho), dtype = torch.float64)
-            step_indices = torch.arange(diffusion_length, dtype = torch.float64)    # [0,1,...,num_steps-1]
+            self.init_shift = torch.tensor(self.sigma_max**(1/self.rho))
+            self.init_scale = torch.tensor(self.sigma_min**(1/self.rho) - self.sigma_max**(1/self.rho))
+            step_indices = torch.arange(diffusion_length)    # [0,1,...,num_steps-1]
             sigmas = (self.init_shift + step_indices/(diffusion_length - 1) * self.init_scale).pow(self.rho)
             increments = (sigmas[1:]-sigmas[:-1]) / (sigma_min-sigma_max)           # dm_length - 1
             logits = increments.log()
@@ -86,11 +90,11 @@ class softmax_model_batch(nn.Module):
             logits = logits + c
             self.init_vec = logits[:-1]             # less 1 degree of freedom due to soft-max. dm_length - 2
         else:
-            self.init_vec=torch.randn(self.dm_length - 2, dtype = torch.float64)
+            self.init_vec=torch.randn(self.dm_length - 2)
         self.vec = torch.nn.Parameter(self.init_vec, requires_grad = True)
 
     def forward(self, positions):
-        ph = torch.ones_like(self.init_vec[:1], dtype=torch.float64, device=self.vec.device)
+        ph = torch.ones_like(self.init_vec[:1], device=self.vec.device)
         v = torch.cat([self.vec, ph])
         increment = F.softmax(v, dim = 0)
         percentage = torch.einsum('i,bji->bj', increment, positions)
@@ -99,28 +103,53 @@ class softmax_model_batch(nn.Module):
 
 class finetune_wrapper(nn.Module):
 
-    def __init__(self, diffusion_network_kwargs, interface_kwargs, sigma_model_kwargs, loss_mode='Dns'):
-        super().__init__()
-        self.diffusion_net = dnnlib.util.construct_class_by_name(**diffusion_network_kwargs, **interface_kwargs)
-        self.sigma_model = dnnlib.util.construct_class_by_name(**sigma_model_kwargs)
-        self.loss_mode = loss_mode
+    def __init__(
+            self,
+            diffusion_network_kwargs,
+            interface_kwargs,
+            sigma_model_kwargs,
+            loss_mode='Dns',
+            pretrained_dm=None,
+            ):
 
-    def get_loss(self, images, labels, augment_pipe=None):
+        super().__init__()
+        d_model = dnnlib.util.construct_class_by_name(**diffusion_network_kwargs, **interface_kwargs)
+        self.diffusion = d_model.train()
+        s_model = dnnlib.util.construct_class_by_name(**sigma_model_kwargs)
+        self.sigma_model = s_model.eval()
+        for param in self.sigma_model.parameters():
+            param.requires_grad = False
+        self.loss_mode = loss_mode
+        if pretrained_dm is not None:
+            self.init_from_pretrained(pretrained_dm)
+
+    def init_from_pretrained(self, pretrained_dm):
+        dist.print0(f'Loading network weights from "{pretrained_dm}"...')
+        if dist.get_rank() != 0:
+            torch.distributed.barrier() # rank 0 goes first
+        with dnnlib.util.open_url(pretrained_dm, verbose=(dist.get_rank() == 0)) as f:
+            data = pickle.load(f)
+        if dist.get_rank() == 0:
+            torch.distributed.barrier() # other ranks follow
+        misc.copy_params_and_buffers(src_module=data['ema'], dst_module=self.diffusion, require_all=False)
+        del data # conserve memory
+
+    def _get_loss_legacy(self, images, labels, augment_pipe=None):
         batch_size = images.shape[0]
-        t = np.random.randint(sigma_model.dm_length - 1, size=batch_size)   # length-1 increments
+        t = np.random.randint(self.sigma_model.dm_length - 1, size=batch_size)   # length-1 increments
         index = [[j for j in range(i)] for i in t]
-        summation_vec = np.zeros([batch_size, sigma_model.dm_length - 1])
+        summation_vec = np.zeros([batch_size, self.sigma_model.dm_length - 1])
         index_next = [[j for j in range(i)] for i in t+1]
-        summation_vec_next = np.zeros([batch_size, sigma_model.dm_length - 1])
+        summation_vec_next = np.zeros([batch_size, self.sigma_model.dm_length - 1])
         for i in range(batch_size):
             summation_vec[i, index[i]] = 1
             summation_vec_next[i, index_next[i]] = 1
 
         summation_tensor = torch.stack((torch.from_numpy(summation_vec), torch.from_numpy(summation_vec_next)), dim=1)
-        sigmas = sigma_model(summation_tensor.to(images.device))  # batch of [cur_sigma, next_sigma]
+        print('before forward:', torch.cuda.max_memory_allocated(images.device)/ 2**30)
+        sigmas = self.sigma_model(summation_tensor.to(images.device)).unsqueeze(-1).unsqueeze(-1)  # batch of [cur_sigma, next_sigma]
         cur_sigma, next_sigma = sigmas.chunk(2, dim = 1)    # [batch, 1]
-        print(cur_sigma, next_sigma)
-        if self.mode == 'Dns':
+        if self.loss_mode == 'Dns':
             # denoised weights
             weights = 1 / next_sigma - 1 / cur_sigma
         else:
@@ -131,7 +160,46 @@ class finetune_wrapper(nn.Module):
         # reg_index = torch.ones([1,1,1,1], device = images.device, dtype = rnd_index.dtype) * dm_length
         # rnd_index = torch.cat([rnd_index, reg_index], dim=0)
         y, augment_labels = augment_pipe(images) if augment_pipe is not None else (images, None)
-        n = torch.randn_like(y) * cur_sigma
-        D_yn = diffusion_net(y + n, cur_sigma, labels, augment_labels=augment_labels)
+        n = torch.randn_like(y) * cur_sigma+next_sigma
+        D_yn = self.diffusion(y + n, cur_sigma+next_sigma, labels, augment_labels=augment_labels)
         loss = weights * ((D_yn - y).pow(2))
+        print('after forward:', torch.cuda.max_memory_allocated(images.device)/ 2**30)
         return loss
+
+    def forward(self, images, labels, summation_tensor, augment_pipe=None):
+        print('before forward:', torch.cuda.max_memory_allocated(images.device)/ 2**30)
+        sigmas = self.sigma_model(summation_tensor.to(images.device)).unsqueeze(-1).unsqueeze(-1)  # batch of [cur_sigma, next_sigma]
+        cur_sigma, next_sigma = sigmas.chunk(2, dim = 1)    # [batch, 1]
+        if self.loss_mode == 'Dns':
+            # denoised weights
+            weights = 1 / next_sigma - 1 / cur_sigma
+        else:
+            # epsilon weights
+            weights = next_sigma / cur_sigma
+            weights = 1 / weights - 1
+
+        # reg_index = torch.ones([1,1,1,1], device = images.device) * dm_length
+        # rnd_index = torch.cat([rnd_index, reg_index], dim=0)
+        y, augment_labels = augment_pipe(images) if augment_pipe is not None else (images, None)
+        
+        rnd_sigma = torch.randn([images.shape[0], 1, 1, 1], device=images.device)
+        n = torch.randn_like(y) * rnd_sigma
+        D_yn = self.diffusion(y + n, rnd_sigma, labels, augment_labels=augment_labels)
+        # loss = weights * ((D_yn - y).pow(2))
+        loss = ((D_yn - y).pow(2)) + weights
+        return loss
+
+    def get_loss(self, images, labels, augment_pipe=None):
+        torch.cuda.reset_peak_memory_stats()
+        batch_size = images.shape[0]
+        t = np.random.randint(self.sigma_model.dm_length - 1, size=batch_size)   # length-1 increments
+        index = [[j for j in range(i)] for i in t]
+        summation_vec = np.zeros([batch_size, self.sigma_model.dm_length - 1])
+        index_next = [[j for j in range(i)] for i in t+1]
+        summation_vec_next = np.zeros([batch_size, self.sigma_model.dm_length - 1])
+        for i in range(batch_size):
+            summation_vec[i, index[i]] = 1
+            summation_vec_next[i, index_next[i]] = 1
+
+        summation_tensor = torch.stack((torch.from_numpy(summation_vec), torch.from_numpy(summation_vec_next)), dim=1).to(torch.float32)
+        return self(images, labels, summation_tensor, augment_pipe)
