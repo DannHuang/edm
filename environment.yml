@@ -1,4 +1,4 @@
-name: 2nd_DMSDE
+name: edm
 channels:
   - pytorch
   - nvidia

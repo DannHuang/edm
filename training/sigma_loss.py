@@ -1,6 +1,7 @@
 """Loss functions used in the paper
 "<placeholder>"."""
 
+import numpy as np
 import torch
 from torch_utils import persistence
 
@@ -11,37 +12,40 @@ from torch_utils import persistence
 
 @persistence.persistent_class
 class SoftmaxLoss:
-    def __init__(self, sigma_min=0.002, sigma_max=80.0, mode='Dns'):
-        self.sigma_min = torch.tensor(sigma_min, dtype=torch.float64)
-        self.sigma_max = torch.tensor(sigma_max, dtype=torch.float64)
+
+    def __init__(self, mode='Dns'):
         self.mode=mode
 
-    def __call__(self, lambda_net, diffusion_net, images, labels, augment_pipe=None):
-        sigmas=lambda_net.sigmas(sigma_max=self.sigma_max, sigma_min=self.sigma_min)
-        dm_length=sigmas.shape[0] - 1
-        batch_size=images.shape[0]
-        sigmas_next=sigmas[1:]
-        sigmas=sigmas[:-1]
-        if self.mode=='Eps':
-            # epsilon weights
-            weights=sigmas_next/sigmas
-            weights=1/weights-1
+    def __call__(self, sigma_model, diffusion_net, images, labels, augment_pipe=None):
+        batch_size = images.shape[0]
+        t = np.random.randint(sigma_model.dm_length - 1, size=batch_size)   # length-1 increments
+        index = [[j for j in range(i)] for i in t]
+        summation_vec = np.zeros([batch_size, sigma_model.dm_length - 1])
+        index_next = [[j for j in range(i)] for i in t+1]
+        summation_vec_next = np.zeros([batch_size, sigma_model.dm_length - 1])
+        for i in range(batch_size):
+            summation_vec[i, index[i]] = 1
+            summation_vec_next[i, index_next[i]] = 1
+
+        summation_tensor = torch.stack((torch.from_numpy(summation_vec), torch.from_numpy(summation_vec_next)), dim=1)
+        sigmas = sigma_model(summation_tensor.to(images.device))  # batch of [cur_sigma, next_sigma]
+        cur_sigma, next_sigma = sigmas.chunk(2, dim = 1)    # [batch, 1]
+        print(cur_sigma, next_sigma)
+        if self.mode == 'Dns':
+            # denoised weights
+            weights = 1 / next_sigma - 1 / cur_sigma
         else:
-            # # denoised weights
-            weights=1/sigmas_next-1/sigmas
-        rnd_index = torch.randint(dm_length, [batch_size,1,1,1], device=images.device)
-        # reg_index = torch.ones([1,1,1,1], device=images.device, dtype=rnd_index.dtype)*dm_length
+            # epsilon weights
+            weights = next_sigma / cur_sigma
+            weights = 1 / weights - 1
+
+        # reg_index = torch.ones([1,1,1,1], device = images.device, dtype = rnd_index.dtype) * dm_length
         # rnd_index = torch.cat([rnd_index, reg_index], dim=0)
-        sigma = sigmas[rnd_index]
-        weight = weights[rnd_index]
         y, augment_labels = augment_pipe(images) if augment_pipe is not None else (images, None)
-        n = torch.randn_like(y) * sigma
-        D_yn = diffusion_net(y + n, sigma, labels, augment_labels=augment_labels)
-        loss = weight * ((D_yn - y).pow(2))
-        # print(f'loss at each step: {((D_yn - y).pow(2).sum()/batch_size).tolist()}')
-        # print(f'loss at {sigma[batch_size-1].item():.3f}={loss[batch_size-1,0,0,0].item():.2f}')
-        return (loss,)
-    
+        n = torch.randn_like(y) * cur_sigma
+        D_yn = diffusion_net(y + n, cur_sigma, labels, augment_labels=augment_labels)
+        loss = weights * ((D_yn - y).pow(2))
+        return loss
 
 #----------------------------------------------------------------------------
 # lambdas define the sigma ratio, lambdas[i]=sigmas[i]/sigmas[i+1], sigmas[T]=sigma_max
