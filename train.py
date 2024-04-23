@@ -170,7 +170,7 @@ def main(**kwargs):
             # c.sigma_network_kwargs.sigma_max = opts.sigma_max
             # c.sigma_network_kwargs.sigma_min = opts.sigma_min
             # c.sigma_network_kwargs.rho = opts.rho
-            c.loss_kwargs.class_name = 'training.sigma_loss.SoftmaxLoss'
+            c.loss_kwargs.class_name = 'training.sigma_loss.SigmaFinetuneLoss'
         else:
             assert opts.sigma_arch=='sigmoid', f"Unknown sigma model {opts.sigma_arch}"
             c.sigma_network_kwargs.class_name = 'training.sigma_model.sigmoid_model'
@@ -178,7 +178,7 @@ def main(**kwargs):
             # c.sigma_network_kwargs.sigma_min = opts.sigma_min
             # c.sigma_network_kwargs.rho = opts.rho
             c.loss_kwargs.class_name = 'training.sigma_loss.SigmoidLoss'
-        c.loss_kwargs.update(mode=opts.sigma_precond)
+        c.loss_kwargs.update(mode=opts.sigma_precond, dm_length=opts.dm_length)
         c.sigma_network_kwargs.update(diffusion_length=opts.dm_length)
         train_func_name = 'training.training_loop.sigma_training_loop'
 
@@ -211,6 +211,7 @@ def main(**kwargs):
         assert opts.pretrain is not None, "Sigma learning requires a pretrained diffusion model"
         c.pretrain_dm = opts.pretrain
         c.ema_rampup_ratio = None
+        c.lr_rampup_kimg = 50           # enough for sigma model converge
     if opts.transfer is not None:
         raise NotImplementedError('Transfer learning is not supported')
         if opts.resume is not None:

@@ -71,8 +71,6 @@ class EDMLoss:
         self.sigma_data = sigma_data
 
     def __call__(self, net, images, labels=None, augment_pipe=None):
-        torch.cuda.reset_peak_memory_stats()
-        print('before forward:', torch.cuda.max_memory_allocated(images.device)/ 2**30)
         rnd_normal = torch.randn([images.shape[0], 1, 1, 1], device=images.device)
         sigma = (rnd_normal * self.P_std + self.P_mean).exp()
         weight = (sigma ** 2 + self.sigma_data ** 2) / (sigma * self.sigma_data) ** 2

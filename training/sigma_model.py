@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_utils import misc
 import torch_utils.distributed as dist
+from generate import StackedRandomGenerator
 
 class sigmoid_model(nn.Module):
     def __init__(self, dm_length=10, sigma_max=80.0, sigma_min=0.002, rho=3.0):
@@ -116,9 +117,7 @@ class finetune_wrapper(nn.Module):
         d_model = dnnlib.util.construct_class_by_name(**diffusion_network_kwargs, **interface_kwargs)
         self.diffusion = d_model.train()
         s_model = dnnlib.util.construct_class_by_name(**sigma_model_kwargs)
-        self.sigma_model = s_model.eval()
-        for param in self.sigma_model.parameters():
-            param.requires_grad = False
+        self.sigma_model = s_model.train()
         self.loss_mode = loss_mode
         if pretrained_dm is not None:
             self.init_from_pretrained(pretrained_dm)
@@ -135,6 +134,7 @@ class finetune_wrapper(nn.Module):
         del data # conserve memory
 
     def _get_loss_legacy(self, images, labels, augment_pipe=None):
+        torch.cuda.reset_peak_memory_stats()
         batch_size = images.shape[0]
         t = np.random.randint(self.sigma_model.dm_length - 1, size=batch_size)   # length-1 increments
         index = [[j for j in range(i)] for i in t]
@@ -167,7 +167,6 @@ class finetune_wrapper(nn.Module):
         return loss
 
     def forward(self, images, labels, summation_tensor, augment_pipe=None):
-        print('before forward:', torch.cuda.max_memory_allocated(images.device)/ 2**30)
         sigmas = self.sigma_model(summation_tensor.to(images.device)).unsqueeze(-1).unsqueeze(-1)  # batch of [cur_sigma, next_sigma]
         cur_sigma, next_sigma = sigmas.chunk(2, dim = 1)    # [batch, 1]
         if self.loss_mode == 'Dns':
@@ -181,16 +180,12 @@ class finetune_wrapper(nn.Module):
         # reg_index = torch.ones([1,1,1,1], device = images.device) * dm_length
         # rnd_index = torch.cat([rnd_index, reg_index], dim=0)
         y, augment_labels = augment_pipe(images) if augment_pipe is not None else (images, None)
-        
-        rnd_sigma = torch.randn([images.shape[0], 1, 1, 1], device=images.device)
-        n = torch.randn_like(y) * rnd_sigma
-        D_yn = self.diffusion(y + n, rnd_sigma, labels, augment_labels=augment_labels)
-        # loss = weights * ((D_yn - y).pow(2))
-        loss = ((D_yn - y).pow(2)) + weights
+        n = torch.randn_like(y) * cur_sigma
+        D_yn = self.diffusion(y + n, cur_sigma, labels, augment_labels=augment_labels)
+        loss = weights * ((D_yn - y).pow(2))
         return loss
 
     def get_loss(self, images, labels, augment_pipe=None):
-        torch.cuda.reset_peak_memory_stats()
         batch_size = images.shape[0]
         t = np.random.randint(self.sigma_model.dm_length - 1, size=batch_size)   # length-1 increments
         index = [[j for j in range(i)] for i in t]
@@ -203,3 +198,39 @@ class finetune_wrapper(nn.Module):
 
         summation_tensor = torch.stack((torch.from_numpy(summation_vec), torch.from_numpy(summation_vec_next)), dim=1).to(torch.float32)
         return self(images, labels, summation_tensor, augment_pipe)
+
+    def sample(self, batch_size=64, class_idx=None, device=None):
+        with torch.no_grad():
+            # Create learned schedule
+            t = np.array([i for i in range(self.sigma_model.dm_length)])
+            index = [[j for j in range(i)] for i in t]
+            summation_vec = np.zeros([self.sigma_model.dm_length, self.sigma_model.dm_length - 1])
+            summation_vec_next = np.zeros([self.sigma_model.dm_length, self.sigma_model.dm_length - 1])
+            for i in range(self.sigma_model.dm_length):
+                summation_vec[i, index[i]] = 1
+            summation_tensor = torch.stack((torch.from_numpy(summation_vec), torch.from_numpy(summation_vec_next)), dim=1).to(torch.float32)
+            sigma = self.sigma_model(summation_tensor.to(device))
+            sigmas, _ = sigma.chunk(2, dim=1)
+            dist.print0(f'Sampling with sigmas: {[s.item() for s in sigmas.squeeze()]}')
+
+            # Pick latents and labels.
+            seeds = [i for i in range(batch_size)]
+            rnd = StackedRandomGenerator(device, seeds)
+            latents = rnd.randn([batch_size, self.diffusion.img_channels, self.diffusion.img_resolution, self.diffusion.img_resolution], device=device)
+            class_labels = None
+            if self.diffusion.label_dim:
+                class_labels = torch.eye(self.diffusion.label_dim, device=device)[rnd.randint(self.diffusion.label_dim, size=[batch_size], device=device)]
+            if class_idx is not None:
+                class_labels[:, :] = 0
+                class_labels[:, class_idx] = 1      # one-hot
+
+            # Sampling loop.
+            x_next = latents.to(torch.float64) * sigmas[0]     # amplify to sigma_max variance
+            for i, (sigma_cur, sigma_next) in enumerate(zip(sigmas[:-1], sigmas[1:])): # 0, ..., N-1
+                x_cur = x_next
+                # # Euler step.
+                denoised = self.diffusion(x_cur, sigma_cur, class_labels).to(torch.float64)
+                eps = (x_cur - denoised) / sigma_cur  
+                x_next = denoised + sigma_next * eps
+
+        return x_next

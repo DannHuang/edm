@@ -15,7 +15,9 @@ import pickle
 import psutil
 import numpy as np
 import torch
+import torchvision
 import dnnlib
+from torch.utils.tensorboard import SummaryWriter
 from torch_utils import distributed as dist
 from torch_utils import training_stats
 from torch_utils import misc
@@ -267,35 +269,34 @@ def sigma_training_loop(
     dataset_sampler = misc.InfiniteSampler(dataset=dataset_obj, rank=dist.get_rank(), num_replicas=dist.get_world_size(), seed=seed)
     dataset_iterator = iter(torch.utils.data.DataLoader(dataset=dataset_obj, sampler=dataset_sampler, batch_size=batch_gpu, **data_loader_kwargs))
 
-    # Construct Finetune wrapper.
-    dist.print0('Constructing diffusion models...')
+    # Construct network.
+    dist.print0('Initializing models...')
     interface_kwargs = dict(img_resolution=dataset_obj.resolution, img_channels=dataset_obj.num_channels, label_dim=dataset_obj.label_dim)
-    net = finetune_wrapper(network_kwargs, interface_kwargs, sigma_network_kwargs)
+    net = finetune_wrapper(network_kwargs, interface_kwargs, sigma_network_kwargs, pretrained_dm=pretrain_dm) # wrap sigma model and diffusion model
     net.to(device)
 
     # Dummy run.
     if dist.get_rank() == 0:
         with torch.no_grad():
-            t = np.array([i for i in range(net.sigma_model.dm_length - 1)])
+            t = np.array([i for i in range(net.sigma_model.dm_length)])
             index = [[j for j in range(i)] for i in t]
-            summation_vec = np.zeros([net.sigma_model.dm_length - 1, net.sigma_model.dm_length - 1])
-            index_next = [[j for j in range(i)] for i in t+1]
-            summation_vec_next = np.zeros([net.sigma_model.dm_length - 1, net.sigma_model.dm_length - 1])
-            for i in range(net.sigma_model.dm_length - 1):
+            summation_vec = np.zeros([net.sigma_model.dm_length, net.sigma_model.dm_length - 1])
+            summation_vec_next = np.zeros([net.sigma_model.dm_length, net.sigma_model.dm_length - 1])
+            for i in range(net.sigma_model.dm_length):
                 summation_vec[i, index[i]] = 1
-                summation_vec_next[i, index_next[i]] = 1
             summation_tensor = torch.stack((torch.from_numpy(summation_vec), torch.from_numpy(summation_vec_next)), dim=1).to(torch.float32)
-
-            images = torch.zeros([batch_gpu, net.diffusion.img_channels, net.diffusion.img_resolution, net.diffusion.img_resolution], device=device)
             sigma = net.sigma_model(summation_tensor.to(device))
             cur_sigma, next_sigma = sigma.chunk(2, dim=1)
-            dist.print0(f"sigma model init with {cur_sigma} and {next_sigma}")
+            dist.print0(f"sigma model init with {[s.item() for s in cur_sigma.squeeze()]}")
+
+            images = torch.zeros([batch_gpu, net.diffusion.img_channels, net.diffusion.img_resolution, net.diffusion.img_resolution], device=device)
             labels = torch.zeros([batch_gpu, net.diffusion.label_dim], device=device)
             sum_tensor = torch.zeros([batch_gpu, 2, net.sigma_model.dm_length - 1], device=device)
             misc.print_module_summary(net, [images, labels, sum_tensor], max_nesting=2)
 
     # Setup optimizer.
     dist.print0('Setting up optimizer...')
+    loss_fn = dnnlib.util.construct_class_by_name(**loss_kwargs)
     optimizer = dnnlib.util.construct_class_by_name(params=net.parameters(), **optimizer_kwargs) # subclass of torch.optim.Optimizer
     augment_pipe = dnnlib.util.construct_class_by_name(**augment_kwargs) if augment_kwargs is not None else None # training.augment.AugmentPipe
     ddp = torch.nn.parallel.DistributedDataParallel(net, device_ids=[device])
@@ -323,6 +324,8 @@ def sigma_training_loop(
     # Train.
     dist.print0(f'Training for {total_kimg} kimg. Starts from {resume_kimg} kimg...')
     dist.print0()
+    if dist.get_rank() == 0:    # TODO: writer on all processes
+        writer = SummaryWriter(os.path.join(run_dir, 'tensorboard'))
     cur_nimg = resume_kimg * 1000
     cur_tick = 0
     tick_start_nimg = cur_nimg
@@ -333,33 +336,36 @@ def sigma_training_loop(
     while True:
 
         # Accumulate gradients.
-        optimizer.zero_grad()
-        total_loss=0
+        optimizer.zero_grad(set_to_none=True)
         for round_idx in range(num_accumulation_rounds):
-        #     with misc.ddp_sync(ddp, (round_idx == num_accumulation_rounds - 1)):
-            images, labels = next(dataset_iterator)
-            images = images.to(device).to(torch.float32) / 127.5 - 1
-            labels = labels.to(device)
-            loss = net.get_loss(images=images, labels=labels, augment_pipe=augment_pipe)
-            if isinstance(loss, tuple):
-                regu=loss[1].sum().mul(loss_scaling / batch_gpu_total)
-                loss=loss[0]
-            training_stats.report('Loss/loss', loss)
-            loss=loss.sum().mul(loss_scaling / batch_gpu_total)
-            total_loss+=loss
-            loss.backward()
+            with misc.ddp_sync(ddp, (round_idx == num_accumulation_rounds - 1)):
+                images, labels = next(dataset_iterator)
+                images = images.to(device).to(torch.float32) / 127.5 - 1
+                labels = labels.to(device)
+                loss = loss_fn(model=ddp, images=images, labels=labels, augment_pipe=augment_pipe)
+                if isinstance(loss, tuple):
+                    regu=loss[1].sum().mul(loss_scaling / batch_gpu_total)
+                    loss=loss[0]
+                training_stats.report('Loss/loss', loss)
+                loss.sum().mul(loss_scaling / batch_gpu_total).backward()
 
-        # # Update weights.
-        # for g in optimizer.param_groups:
-            # g['lr'] = optimizer_kwargs['lr'] * min(cur_nimg / max(lr_rampup_kimg * 1000, 1e-8), 1)
-            # print(g['lr'])
+
+        # Update weights.
+        for g in optimizer.param_groups:
+            g['lr'] = optimizer_kwargs['lr'] * min(cur_nimg / max(lr_rampup_kimg * 1000, 1e-8), 1)
         for param in net.parameters():
             if param.grad is not None:
                 torch.nan_to_num(param.grad, nan=0, posinf=1e5, neginf=-1e5, out=param.grad)
         optimizer.step()
-        continue
+        if dist.get_rank() == 0:
+            period_out = [v for v in training_stats._counters['Loss/loss'].values()]
+            periord_loss_stats = period_out[0]
+            if int(periord_loss_stats[0]) > 0:
+                writer.add_scalar("Loss/train",
+                                  float(periord_loss_stats[1] / periord_loss_stats[0]),
+                                  cur_nimg // 1000)
 
-        # # Update EMA.
+        # Update EMA.
         ema_halflife_nimg = ema_halflife_kimg * 1000
         if ema_rampup_ratio is not None:
             ema_halflife_nimg = min(ema_halflife_nimg, cur_nimg * ema_rampup_ratio)
@@ -378,19 +384,28 @@ def sigma_training_loop(
         fields = []
         fields += [f"tick {training_stats.report0('Progress/tick', cur_tick):<5d}"]
         fields += [f"kimg {training_stats.report0('Progress/kimg', cur_nimg / 1e3):<9.1f}"]
-        fields += [f"time {dnnlib.util.format_time(training_stats.report0('Timing/total_sec', tick_end_time - start_time)):<12s}"]
+        # fields += [f"time {dnnlib.util.format_time(training_stats.report0('Timing/total_sec', tick_end_time - start_time)):<12s}"]
         fields += [f"sec/tick {training_stats.report0('Timing/sec_per_tick', tick_end_time - tick_start_time):<7.1f}"]
-        fields += [f"sec/kimg {training_stats.report0('Timing/sec_per_kimg', (tick_end_time - tick_start_time) / (cur_nimg - tick_start_nimg) * 1e3):<7.2f}"]
+        # fields += [f"sec/kimg {training_stats.report0('Timing/sec_per_kimg', (tick_end_time - tick_start_time) / (cur_nimg - tick_start_nimg) * 1e3):<7.2f}"]
         fields += [f"maintenance {training_stats.report0('Timing/maintenance_sec', maintain_time):<6.1f}"]
         fields += [f"cpumem {training_stats.report0('Resources/cpu_mem_gb', psutil.Process(os.getpid()).memory_info().rss / 2**30):<6.2f}"]
         fields += [f"gpumem {training_stats.report0('Resources/peak_gpu_mem_gb', torch.cuda.max_memory_allocated(device) / 2**30):<6.2f}"]
         fields += [f"reserved {training_stats.report0('Resources/peak_gpu_mem_reserved_gb', torch.cuda.max_memory_reserved(device) / 2**30):<6.2f}"]
         torch.cuda.reset_peak_memory_stats()
         dist.print0(' '.join(fields))
+
+        # Print current sigma
         with torch.no_grad():
-            sigmas=lambda_net.sigmas()
-        sigmas=[f'{s:.3f}'for s in sigmas]
-        dist.print0(f'loss={total_loss:.2f} | regu={total_regu:.2f} | sigmas={sigmas}')
+            t = np.array([i for i in range(net.sigma_model.dm_length)])
+            index = [[j for j in range(i)] for i in t]
+            summation_vec = np.zeros([net.sigma_model.dm_length, net.sigma_model.dm_length - 1])
+            summation_vec_next = np.zeros([net.sigma_model.dm_length, net.sigma_model.dm_length - 1])
+            for i in range(net.sigma_model.dm_length):
+                summation_vec[i, index[i]] = 1
+            summation_tensor = torch.stack((torch.from_numpy(summation_vec), torch.from_numpy(summation_vec_next)), dim=1).to(torch.float32)
+            sigma = net.sigma_model(summation_tensor.to(device))
+            cur_sigma, next_sigma = sigma.chunk(2, dim=1)
+        dist.print0(f'Schedule: {[s.item() for s in cur_sigma.squeeze()]}')
 
         # Check for abort.
         if (not done) and dist.should_stop():
@@ -398,31 +413,37 @@ def sigma_training_loop(
             dist.print0()
             dist.print0('Aborting...')
 
-        # Save network snapshot.
+        # Save network snapshot. Should avoid frequently usage.
         if (snapshot_ticks is not None) and (done or cur_tick % snapshot_ticks == 0):
-            # data = dict(ema=ema, loss_fn=loss_fn, augment_pipe=augment_pipe, dataset_kwargs=dict(dataset_kwargs))
-            # for key, value in data.items():
-            #     if isinstance(value, torch.nn.Module):
-            #         value = copy.deepcopy(value).eval().requires_grad_(False)
-            #         misc.check_ddp_consistency(value)
-            #         data[key] = value.cpu()
-            #     del value # conserve memory
+            data = dict(ema=ema, loss_fn=loss_fn, augment_pipe=augment_pipe, dataset_kwargs=dict(dataset_kwargs))
+            for key, value in data.items():
+                if isinstance(value, torch.nn.Module):
+                    value = copy.deepcopy(value).eval().requires_grad_(False)
+                    misc.check_ddp_consistency(value)
+                    data[key] = value.cpu()
+                del value # conserve memory
             if dist.get_rank() == 0:
-                sigmas=ema.sigmas()
-                with open(os.path.join(run_dir, 'sigmas-snapshot.txt'), 'a') as f:
-                    f.write(f'{cur_nimg//1000:06d} sigmas: ')
-                    f.write(str(sigmas))
-                    f.write('\n')
-            # del data # conserve memory
+                with open(os.path.join(run_dir, f'network-snapshot.pkl'), 'wb') as f:
+                    pickle.dump(data, f)
+            del data # conserve memory
+
+        # Save full dump of the training state.
+        if (state_dump_ticks is not None) and (done or cur_tick % state_dump_ticks == 0) and cur_tick != 0 and dist.get_rank() == 0:
+            torch.save(dict(net=net, optimizer_state=optimizer.state_dict()), os.path.join(run_dir, f'training-state-{cur_nimg//1000:06d}.pt'))
 
         # Update logs.
-        # training_stats.default_collector.update()
-        # if dist.get_rank() == 0:
-        #     if stats_jsonl is None:
-        #         stats_jsonl = open(os.path.join(run_dir, 'stats.jsonl'), 'at')
-        #     stats_jsonl.write(json.dumps(dict(training_stats.default_collector.as_dict(), timestamp=time.time())) + '\n')
-        #     stats_jsonl.flush()
-        # dist.update_progress(cur_nimg // 1000, total_kimg)
+        training_stats.default_collector.update()
+        if dist.get_rank() == 0:
+            if stats_jsonl is None:
+                stats_jsonl = open(os.path.join(run_dir, 'stats.jsonl'), 'at')
+            stats_jsonl.write(json.dumps(dict(training_stats.default_collector.as_dict(), timestamp=time.time())) + '\n')
+            stats_jsonl.flush()
+            # visual samples
+            images = net.sample(device=device)
+            images = (images + 1.) / 2.
+            img_grid = torchvision.utils.make_grid(images)
+            writer.add_image('samples', img_grid)
+        dist.update_progress(cur_nimg // 1000, total_kimg)
 
         # Update state.
         cur_tick += 1
@@ -430,12 +451,10 @@ def sigma_training_loop(
         tick_start_time = time.time()
         maintain_time = tick_start_time - tick_end_time
         if done:
-            # # Save full dump of the training state.
+            # Save full dump of the training state.
+            writer.flush()
             if dist.get_rank() == 0:
-                torch.save(dict(net=lambda_net, optimizer_state=optimizer.state_dict()), os.path.join(run_dir, f'training-state.pt'))
-            # with open(os.path.join(run_dir, 'sigmas-snapshot.txt'), 'a') as f:
-            #     for p in ema.parameters():
-            #         f.write(str(p))
+                torch.save(dict(net=net, optimizer_state=optimizer.state_dict()), os.path.join(run_dir, f'last.pt'))
             break
 
     # Done.
