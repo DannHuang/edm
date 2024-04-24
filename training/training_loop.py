@@ -395,17 +395,17 @@ def sigma_training_loop(
         dist.print0(' '.join(fields))
 
         # Print current sigma
-        with torch.no_grad():
-            t = np.array([i for i in range(net.sigma_model.dm_length)])
-            index = [[j for j in range(i)] for i in t]
-            summation_vec = np.zeros([net.sigma_model.dm_length, net.sigma_model.dm_length - 1])
-            summation_vec_next = np.zeros([net.sigma_model.dm_length, net.sigma_model.dm_length - 1])
-            for i in range(net.sigma_model.dm_length):
-                summation_vec[i, index[i]] = 1
-            summation_tensor = torch.stack((torch.from_numpy(summation_vec), torch.from_numpy(summation_vec_next)), dim=1).to(torch.float32)
-            sigma = net.sigma_model(summation_tensor.to(device))
-            cur_sigma, next_sigma = sigma.chunk(2, dim=1)
-        dist.print0(f'Schedule: {[s.item() for s in cur_sigma.squeeze()]}')
+        # with torch.no_grad():
+        #     t = np.array([i for i in range(net.sigma_model.dm_length)])
+        #     index = [[j for j in range(i)] for i in t]
+        #     summation_vec = np.zeros([net.sigma_model.dm_length, net.sigma_model.dm_length - 1])
+        #     summation_vec_next = np.zeros([net.sigma_model.dm_length, net.sigma_model.dm_length - 1])
+        #     for i in range(net.sigma_model.dm_length):
+        #         summation_vec[i, index[i]] = 1
+        #     summation_tensor = torch.stack((torch.from_numpy(summation_vec), torch.from_numpy(summation_vec_next)), dim=1).to(torch.float32)
+        #     sigma = net.sigma_model(summation_tensor.to(device))
+        #     cur_sigma, next_sigma = sigma.chunk(2, dim=1)
+        # dist.print0(f'Schedule: {[s.item() for s in cur_sigma.squeeze()]}')
 
         # Check for abort.
         if (not done) and dist.should_stop():
@@ -442,7 +442,7 @@ def sigma_training_loop(
             images = net.sample(device=device)
             images = (images + 1.) / 2.
             img_grid = torchvision.utils.make_grid(images)
-            writer.add_image('samples', img_grid)
+            writer.add_image('samples', img_grid, cur_tick)
         dist.update_progress(cur_nimg // 1000, total_kimg)
 
         # Update state.
