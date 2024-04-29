@@ -18,9 +18,11 @@ import torch
 import PIL.Image
 import dnnlib
 from torch_utils import distributed as dist
+from torch.autograd.functional import jvp
+import torch.autograd.forward_ad as fwAD
 
 #----------------------------------------------------------------------------
-# Our new 2nd-order sampler.
+# Our new 2nd-order sampler. 1000img FID = 41.5904
 
 def edm_sampler(
     net, latents, class_labels=None, randn_like=torch.randn_like,
@@ -38,11 +40,53 @@ def edm_sampler(
     step_indices = torch.arange(num_steps, dtype=torch.float64, device=latents.device)  # [0,1,...,num_steps-1]
     sigmas = (A + step_indices/(num_steps-1)*B).pow(rho)
     sigmas = torch.cat([net.round_sigma(sigmas), torch.zeros_like(sigmas[:1])]) # t_steps[num_steps] = 0
+    dt_org = torch.tensor(1/(num_steps-1), dtype=torch.float64, device=latents.device)
 
     # # Main sampling loop.
     x_next = latents.to(torch.float64) * sigmas[0]     # amplify to sigma_max variance
     for i, (sigma_cur, sigma_next) in enumerate(zip(sigmas[:-1], sigmas[1:])): # 0, ..., N-1
         x_cur = x_next
+        dt = dt_org
+
+        # # increase nosie level except last iteration
+        if i<num_steps-1:
+            diffusion_coff = dt**((rho-1)/2)*((-B)**(rho)).sqrt()
+            if randn_like.__name__ == 'multiGaussian_like':
+                noise = randn_like(x_cur, dt)
+            else:
+                noise = [dt**0.5*randn_like(x_cur)]
+            x_cur = x_cur + diffusion_coff * noise[0]
+            sigma_cur = (sigma_cur**2 + dt*diffusion_coff**2).sqrt()
+            dt = (sigma_next**(1/rho) - sigma_cur**(1/rho))/B
+
+        gamma=torch.tensor(0.0, dtype=torch.float64, device=latents.device)
+        prod=torch.tensor(1.0, dtype=torch.float64, device=latents.device)
+        for j in range(1, int(rho)):
+            prod *= (B*(rho-j+1)/j)
+            gamma += dt**(j-1)*prod*sigma_cur**((rho-j)/rho)
+
+        '''
+        # # Apply 2nd order correction.
+        if i < num_steps - 2 and sigma_cur > S_max:
+            # # Euler step.
+            denoised = net(x_cur, sigma_cur, class_labels).to(torch.float64)
+            f_cur = (x_cur - denoised) / sigma_cur
+            x_next = x_cur + gamma*f_cur*dt
+            # # v1.0 implementation
+            # dsigma = B*rho*(sigma_cur.pow((rho-1)/rho))
+            # ddsigma = rho*(rho-1)*B*B*(sigma_cur.pow((rho-2)/rho))
+            # g_cur = ddsigma*sigma_cur
+            # gamma = dsigma + 0.5*dt*ddsigma     
+            with fwAD.dual_level():
+                dual_x = fwAD.make_dual(x_next, 0.5*dt*dt*gamma/sigma_cur*f_cur)
+                dual_t = fwAD.make_dual(sigma_next, 0.5*dt*dt/sigma_cur)
+                dual_out = net(dual_x, dual_t, class_labels)
+                denoised, jfp = fwAD.unpack_dual(dual_out)
+            jfp = (0.5*dt*dt*gamma/sigma_cur*f_cur + 0.5*dt*dt*gamma/sigma_cur*f_cur -jfp).to(torch.float64)    # 0.5*dt^2 * (x_next-x_cur)
+            # print((f_next-f_cur-JF*2/dt).pow(2).sum().sqrt())           # Jf*2/dt = d(gamma_cur*f(x_next, t_cur) - gamma_cur*f(x_cur, t_cur))
+            # x_next = x_cur + 0.5*(f_cur*gamma+f_next*gamma)*dt``
+            x_next = x_cur + (f_cur*dt + jfp)*gamma
+            '''
 
         # # backward 2nd order sampling.
         if i > 0 and sigma_cur >= S_max:
@@ -318,7 +362,7 @@ def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, device=
     # Load network.
     dist.print0(f'Loading network from local directorty "{network_pkl}"...')
     with open(network_pkl, 'rb') as f:
-        net = pickle.load(f).to(device)
+        net = pickle.load(f)['ema'].to(device)
 
     # Other ranks follow.
     if dist.get_rank() == 0:
@@ -333,22 +377,7 @@ def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, device=
             continue
 
         # Pick latents and labels.
-        rnd = StackedRandomGenerator(device, batch_seeds)
-        latents = rnd.randn([batch_size, net.img_channels, net.img_resolution, net.img_resolution], device=device)
-        class_labels = None
-        if net.label_dim:
-            class_labels = torch.eye(net.label_dim, device=device)[rnd.randint(net.label_dim, size=[batch_size], device=device)]        # random initialize class vector
-        if class_idx is not None:
-            class_labels[:, :] = 0
-            class_labels[:, class_idx] = 1      # one-hot
-
-        # Generate images.
-        sampler_kwargs = {key: value for key, value in sampler_kwargs.items() if value is not None}     # unwrap kwargs, withdraw non-stated params
-        have_ablation_kwargs = any(x in sampler_kwargs for x in ['solver', 'discretization', 'schedule', 'scaling'])
-        if 'randn_like' in sampler_kwargs and type(sampler_kwargs['randn_like']) is str:
-            sampler_kwargs['randn_like'] = rnd.randn_like if sampler_kwargs['randn_like'] == 'db' else rnd.multiGaussian_like
-        sampler_fn = ablation_sampler if have_ablation_kwargs else edm_sampler
-        images = sampler_fn(net, latents, class_labels, **sampler_kwargs)
+        images = net.sample(batch_size=batch_size, class_idx=class_idx, device=device, seeds=batch_seeds)
 
         # Save images.
         images_np = (images * 127.5 + 128).clip(0, 255).to(torch.uint8).permute(0, 2, 3, 1).cpu().numpy()

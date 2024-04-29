@@ -199,7 +199,7 @@ class finetune_wrapper(nn.Module):
         summation_tensor = torch.stack((torch.from_numpy(summation_vec), torch.from_numpy(summation_vec_next)), dim=1).to(torch.float32)
         return self(images, labels, summation_tensor, augment_pipe)
 
-    def sample(self, batch_size=64, class_idx=None, device=None):
+    def sample(self, batch_size=64, class_idx=None, device=None, seeds=None):
         with torch.no_grad():
             # Create learned schedule
             t = np.array([i for i in range(self.sigma_model.dm_length)])
@@ -211,10 +211,13 @@ class finetune_wrapper(nn.Module):
             summation_tensor = torch.stack((torch.from_numpy(summation_vec), torch.from_numpy(summation_vec_next)), dim=1).to(torch.float32)
             sigma = self.sigma_model(summation_tensor.to(device))
             sigmas, _ = sigma.chunk(2, dim=1)
+            # TODO
+            # sigmas = torch.cat([self.diffusion.round_sigma(sigmas), torch.zeros_like(sigmas[:1])])
+            sigmas = torch.cat([sigmas, torch.zeros_like(sigmas[:1])])
             dist.print0(f'Sampling with sigmas: {[s.item() for s in sigmas.squeeze()]}')
 
             # Pick latents and labels.
-            seeds = [i for i in range(batch_size)]
+            seeds = [i for i in range(batch_size)] if seeds is None else seeds
             rnd = StackedRandomGenerator(device, seeds)
             latents = rnd.randn([batch_size, self.diffusion.img_channels, self.diffusion.img_resolution, self.diffusion.img_resolution], device=device)
             class_labels = None
@@ -230,7 +233,7 @@ class finetune_wrapper(nn.Module):
                 x_cur = x_next
                 # # Euler step.
                 denoised = self.diffusion(x_cur, sigma_cur, class_labels).to(torch.float64)
-                eps = (x_cur - denoised) / sigma_cur  
+                eps = (x_cur - denoised) / sigma_cur
                 x_next = denoised + sigma_next * eps
 
         return x_next

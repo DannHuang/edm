@@ -233,18 +233,38 @@ def sigma_training_loop(
     batch_gpu           = None,     # Limit batch size per GPU, None = no limit.
     total_kimg          = 200000,   # Training duration, measured in thousands of training images.
     ema_halflife_kimg   = 500,      # Half-life of the exponential moving average (EMA) of model weights.
-    ema_rampup_ratio    = 0.05,     # EMA ramp-up coefficient, None = no rampup. FIXME
+    ema_rampup_ratio    = None,     # EMA ramp-up coefficient, None = no rampup. No rampup because we are finetuning.
     lr_rampup_kimg      = 10000,    # Learning rate ramp-up duration.
     loss_scaling        = 1,        # Loss scaling factor for reducing FP16 under/overflows.
     kimg_per_tick       = 50,       # Interval of progress prints.
     snapshot_ticks      = 50,       # How often to save network snapshots, None = disable.
     state_dump_ticks    = 500,      # How often to dump training state, None = disable.
+    stage1_ticks        = 4,        # Stage1 training length.
+    stage2_ticks        = 12,        # Stage2 training length.
     resume_pkl          = None,     # Start from the given network snapshot, None = random initialization.
     resume_state_dump   = None,     # Start from the given training state, None = reset training state.
     resume_kimg         = 0,        # Start from the given training progress.
     cudnn_benchmark     = True,     # Enable torch.backends.cudnn.benchmark?
     device              = torch.device('cuda'),
 ):
+    def switch_stage(model, stage1):
+        if stage1:
+            dist.print0('Switching to stage 1: learning sigma model')
+            for p in model.diffusion.parameters():
+                p.requires_grad = False
+            for p in model.sigma_model.parameters():
+                p.requires_grad = True
+            for g in optimizer.param_groups:
+                g['lr'] = optimizer_kwargs['lr'] * 100      # TODO: hyper-parameter
+        else:
+            dist.print0('Switching to stage 2: learning diffusion model')
+            for p in model.diffusion.parameters():
+                p.requires_grad = True
+            for p in model.sigma_model.parameters():
+                p.requires_grad = False
+            for g in optimizer.param_groups:
+                g['lr'] = optimizer_kwargs['lr'] * min(cur_nimg / max(lr_rampup_kimg * 1000, 1e-8), 1)
+
     # Initialize.
     start_time = time.time()
     np.random.seed((seed * dist.get_world_size() + dist.get_rank()) % (1 << 31))
@@ -299,10 +319,10 @@ def sigma_training_loop(
     loss_fn = dnnlib.util.construct_class_by_name(**loss_kwargs)
     optimizer = dnnlib.util.construct_class_by_name(params=net.parameters(), **optimizer_kwargs) # subclass of torch.optim.Optimizer
     augment_pipe = dnnlib.util.construct_class_by_name(**augment_kwargs) if augment_kwargs is not None else None # training.augment.AugmentPipe
-    ddp = torch.nn.parallel.DistributedDataParallel(net, device_ids=[device])
+    ddp = torch.nn.parallel.DistributedDataParallel(net, device_ids=[device], find_unused_parameters=True)
     ema = copy.deepcopy(net).eval().requires_grad_(False)
 
-    # Resume training from previous snapshot. FIXME: not implement yet
+    # Resume training from previous snapshot.
     if resume_pkl is not None:
         dist.print0(f'Loading network weights from "{resume_pkl}"...')
         if dist.get_rank() != 0:
@@ -324,11 +344,15 @@ def sigma_training_loop(
     # Train.
     dist.print0(f'Training for {total_kimg} kimg. Starts from {resume_kimg} kimg...')
     dist.print0()
-    if dist.get_rank() == 0:    # TODO: writer on all processes
-        writer = SummaryWriter(os.path.join(run_dir, 'tensorboard'))
+    if dist.get_rank() == 0:
+        writer = SummaryWriter(log_dir=os.path.join(os.environ["QS_LOG_DIR"], os.environ["TRIAL_NAME"]))
     cur_nimg = resume_kimg * 1000
     cur_tick = 0
+    stage1 = True               # learning sigma
     tick_start_nimg = cur_nimg
+    stage_start_tick = cur_tick
+    stage_ticks = stage1_ticks if stage1 else stage2_ticks
+    switch_stage(net, stage1)
     tick_start_time = time.time()
     maintain_time = tick_start_time - start_time
     dist.update_progress(cur_nimg // 1000, total_kimg)
@@ -351,8 +375,13 @@ def sigma_training_loop(
 
 
         # Update weights.
-        for g in optimizer.param_groups:
-            g['lr'] = optimizer_kwargs['lr'] * min(cur_nimg / max(lr_rampup_kimg * 1000, 1e-8), 1)
+        if stage1:
+            for g in optimizer.param_groups:
+                # TODO: hyper-parameter
+                g['lr'] = optimizer_kwargs['lr'] * min(np.exp(lr_rampup_kimg * 1000 / max(cur_nimg, 1e-8)), 100)
+        else:
+            for g in optimizer.param_groups:
+                g['lr'] = optimizer_kwargs['lr'] * min(cur_nimg / max(lr_rampup_kimg * 1000, 1e-8), 1)
         for param in net.parameters():
             if param.grad is not None:
                 torch.nan_to_num(param.grad, nan=0, posinf=1e5, neginf=-1e5, out=param.grad)
@@ -370,7 +399,7 @@ def sigma_training_loop(
         if ema_rampup_ratio is not None:
             ema_halflife_nimg = min(ema_halflife_nimg, cur_nimg * ema_rampup_ratio)
         ema_beta = 0.5 ** (batch_size / max(ema_halflife_nimg, 1e-8))
-        for p_ema, p_net in zip(ema.parameters(), net.parameters()):    # TODO: ema on diffusion only
+        for p_ema, p_net in zip(ema.parameters(), net.parameters()):
             p_ema.copy_(p_net.detach().lerp(p_ema, ema_beta))
 
         # Perform maintenance tasks once per tick.
@@ -448,6 +477,11 @@ def sigma_training_loop(
         # Update state.
         cur_tick += 1
         tick_start_nimg = cur_nimg
+        if cur_tick - stage_start_tick >= stage_ticks:
+            stage1 = not stage1
+            stage_start_tick = cur_tick
+            stage_ticks = stage1_ticks if stage1 else stage2_ticks
+            switch_stage(net, stage1)
         tick_start_time = time.time()
         maintain_time = tick_start_time - tick_end_time
         if done:
