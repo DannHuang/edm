@@ -44,6 +44,7 @@ def parse_int_list(s):
 # Main options.
 @click.option('--outdir',        help='Where to save the results', metavar='DIR',                   type=str, required=True)
 @click.option('--data',          help='Path to the dataset', metavar='ZIP|DIR',                     type=str, required=True)
+@click.option('--seed',          help='Random seed  [default: random]', metavar='INT',              type=int, default=42, show_default=True)
 
 # Diffusion Model options
 @click.option('--cond',          help='Train class-conditional model', metavar='BOOL',              type=bool, default=False, show_default=True)
@@ -60,29 +61,29 @@ def parse_int_list(s):
 @click.option('--dm-length',     help='sigma length', metavar='INT',                                type=click.IntRange(min=1), default=10, show_default=True)
 
 # Hyperparameters.
-@click.option('--duration',      help='Training duration', metavar='MIMG',                          type=click.FloatRange(min=0, min_open=True), default=1.5, show_default=True)
+@click.option('--duration',      help='Training duration', metavar='MIMG',                          type=click.FloatRange(min=0, min_open=True), default=200, show_default=True)
 @click.option('--batch',         help='Total batch size', metavar='INT',                            type=click.IntRange(min=1), default=512, show_default=True)
 @click.option('--batch-gpu',     help='Limit batch size per GPU', metavar='INT',                    type=click.IntRange(min=1))
-@click.option('--lr',            help='Learning rate', metavar='FLOAT',                             type=click.FloatRange(min=0, min_open=True), default=1e-4, show_default=True)
+@click.option('--stage1-ticks',  help='Stage 1 sigma learning duration', metavar='TICKS',           type=click.IntRange(min=1), default=4, show_default=True)
+@click.option('--stage2-ticks',  help='Stage 2 finetuning duration', metavar='TICKS',               type=click.IntRange(min=1), default=12, show_default=True)
+@click.option('--lr',            help='Learning rate', metavar='FLOAT',                             type=click.FloatRange(min=0, min_open=True), default=10e-4, show_default=True)
 @click.option('--ema',           help='EMA half-life', metavar='MIMG',                              type=click.FloatRange(min=0), default=0.5, show_default=True)
 @click.option('--dropout',       help='Dropout probability', metavar='FLOAT',                       type=click.FloatRange(min=0, max=1), default=0.13, show_default=True)
 @click.option('--augment',       help='Augment probability', metavar='FLOAT',                       type=click.FloatRange(min=0, max=1), default=0.12, show_default=True)
 @click.option('--xflip',         help='Enable dataset x-flips', metavar='BOOL',                     type=bool, default=False, show_default=True)
-
-# Performance-related.
 @click.option('--fp16',          help='Enable mixed-precision training', metavar='BOOL',            type=bool, default=False, show_default=True)
 @click.option('--ls',            help='Loss scaling', metavar='FLOAT',                              type=click.FloatRange(min=0, min_open=True), default=1, show_default=True)
-@click.option('--bench',         help='Enable cuDNN benchmarking', metavar='BOOL',                  type=bool, default=True, show_default=True)
-@click.option('--cache',         help='Cache dataset in CPU memory', metavar='BOOL',                type=bool, default=True, show_default=True)
-@click.option('--workers',       help='DataLoader worker processes', metavar='INT',                 type=click.IntRange(min=1), default=1, show_default=True)
+@click.option('--lr-anneal-kimg',help='learning rate rampup period', metavar='KIMG',                type=click.IntRange(min=1), default=30000, show_default=True)
 
 # I/O-related.
 @click.option('--desc',          help='String to include in result dir name', metavar='STR',        type=str)
 @click.option('--nosubdir',      help='Do not create a subdirectory for results',                   is_flag=True)
+@click.option('--workers',       help='DataLoader worker processes', metavar='INT',                 type=click.IntRange(min=1), default=1, show_default=True)
+@click.option('--cache',         help='Cache dataset in CPU memory', metavar='BOOL',                type=bool, default=True, show_default=True)
+@click.option('--bench',         help='Enable cuDNN benchmarking', metavar='BOOL',                  type=bool, default=True, show_default=True)
 @click.option('--tick',          help='How often to print progress', metavar='KIMG',                type=click.IntRange(min=1), default=50, show_default=True)
 @click.option('--snap',          help='How often to save snapshots', metavar='TICKS',               type=click.IntRange(min=1), default=50, show_default=True)
 @click.option('--dump',          help='How often to dump state', metavar='TICKS',                   type=click.IntRange(min=1), default=500, show_default=True)
-@click.option('--seed',          help='Random seed  [default: random]', metavar='INT',              type=int, default=42, show_default=True)
 @click.option('--transfer',      help='Transfer learning from network pickle', metavar='PKL|URL',   type=str)
 @click.option('--resume',        help='Resume from previous training state', metavar='PT',          type=str)
 @click.option('-n', '--dry-run', help='Print training options and exit',                            is_flag=True)
@@ -203,6 +204,7 @@ def main(**kwargs):
         c.seed = opts.seed
     else:
         seed = torch.randint(1 << 31, size=[], device=torch.device('cuda'))
+        dist.print0(f"Random seed: {seed}")
         torch.distributed.broadcast(seed, src=0)
         c.seed = int(seed)
 
@@ -212,6 +214,9 @@ def main(**kwargs):
         c.pretrain_dm = opts.pretrain
         c.ema_rampup_ratio = None
         c.lr_rampup_kimg = 50           # enough for sigma model converge
+        c.lr_anneal_kimg = opts.lr_anneal_kimg
+        c.stage1_ticks = opts.stage1_ticks
+        c.stage2_ticks = opts.stage2_ticks
     if opts.transfer is not None:
         raise NotImplementedError('Transfer learning is not supported')
         if opts.resume is not None:
