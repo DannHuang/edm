@@ -114,6 +114,8 @@ def training_loop(
     # Train.
     dist.print0(f'Training for {total_kimg} kimg...')
     dist.print0()
+    if dist.get_rank() == 0:
+        writer = SummaryWriter(log_dir=os.path.join(os.environ["QS_LOG_DIR"], os.environ["TRIAL_NAME"]))
     cur_nimg = resume_kimg * 1000
     cur_tick = 0
     tick_start_nimg = cur_nimg
@@ -137,10 +139,21 @@ def training_loop(
         # Update weights.
         for g in optimizer.param_groups:
             g['lr'] = optimizer_kwargs['lr'] * min(cur_nimg / max(lr_rampup_kimg * 1000, 1e-8), 1)
+        if dist.get_rank() == 0:
+            writer.add_scalar("lr",
+                            optimizer_kwargs['lr'] * min(cur_nimg / max(lr_rampup_kimg * 1000, 1e-8), 1),
+                            cur_nimg // 1000)
         for param in net.parameters():
             if param.grad is not None:
                 torch.nan_to_num(param.grad, nan=0, posinf=1e5, neginf=-1e5, out=param.grad)
         optimizer.step()
+        if dist.get_rank() == 0:
+            period_out = [v for v in training_stats._counters['Loss/loss'].values()]
+            periord_loss_stats = period_out[0]
+            if int(periord_loss_stats[0]) > 0:
+                writer.add_scalar("Loss/train",
+                                  float(periord_loss_stats[1] / periord_loss_stats[0]),
+                                  cur_nimg // 1000)
 
         # Update EMA.
         ema_halflife_nimg = ema_halflife_kimg * 1000
@@ -381,9 +394,17 @@ def sigma_training_loop(
         if stage1:
             for g in optimizer.param_groups:
                 g['lr'] = optimizer_kwargs['lr'] * min(np.exp(stage1_anneal_kimg / max(cur_nimg, 1e-8)), 100)
+            if dist.get_rank() == 0:
+                writer.add_scalar("lr/stage1",
+                                optimizer_kwargs['lr'] * min(np.exp(stage1_anneal_kimg / max(cur_nimg, 1e-8)), 100),
+                                cur_nimg // 1000)
         else:
             for g in optimizer.param_groups:
                 g['lr'] = optimizer_kwargs['lr'] * min(cur_nimg / max(lr_rampup_kimg * 1000, 1e-8), 1)
+            if dist.get_rank() == 0:
+                writer.add_scalar("lr/stage2",
+                                optimizer_kwargs['lr'] * min(cur_nimg / max(lr_rampup_kimg * 1000, 1e-8), 1),
+                                cur_nimg // 1000)
         for param in net.parameters():
             if param.grad is not None:
                 torch.nan_to_num(param.grad, nan=0, posinf=1e5, neginf=-1e5, out=param.grad)

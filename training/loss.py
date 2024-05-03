@@ -81,3 +81,38 @@ class EDMLoss:
         return loss
 
 #----------------------------------------------------------------------------
+# Discretization loss with EDM weights
+
+@persistence.persistent_class
+class EDMLoss_dis:
+    def __init__(self, dm_length=10, sigma_min=0.002, sigma_max=80, rho=7):
+        self.dm_length = dm_length
+        self.sigma_min = sigma_min
+        self.sigma_max = sigma_max
+        self.rho = rho
+
+    def __call__(self, net, images, labels=None, augment_pipe=None):
+        sigma_min = self.sigma_min
+        sigma_max = self.sigma_max
+        shift = torch.tensor(sigma_max**(1/self.rho), dtype=torch.float64)
+        scale = torch.tensor(sigma_min**(1/self.rho) - sigma_max**(1/self.rho), dtype=torch.float64)
+        step_indices = torch.arange(self.dm_length, dtype=torch.float64, device=images.device)  # [0,1,...,num_steps-1]
+        sigmas = (shift + step_indices/(self.dm_length-1) * scale).pow(self.rho)
+
+        # # TODO: right now last step sigma-min will not be chosen to finetune
+        # sigmas = torch.cat([sigmas, torch.zeros_like(sigmas[:1])]) # t_steps[num_steps] = 0
+
+        sigma_cur = sigmas[:-1]
+        sigma_next = sigmas[1:]
+        batch_size = images.shape[0]
+        rnd_index = torch.randint(sigma_cur.shape[0], [batch_size,1,1,1], device=images.device)
+        sigma = sigma_cur[rnd_index]
+        weight = 1/sigma_next[rnd_index] - 1/sigma_cur[rnd_index]
+
+        y, augment_labels = augment_pipe(images) if augment_pipe is not None else (images, None)
+        n = torch.randn_like(y) * sigma
+        D_yn = net(y + n, sigma, labels, augment_labels=augment_labels)
+        loss = weight * ((D_yn - y) ** 2)
+        return loss
+
+#----------------------------------------------------------------------------

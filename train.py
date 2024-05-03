@@ -59,6 +59,7 @@ def parse_int_list(s):
 @click.option('--sigma-arch',    help='sigma model arch', metavar='softmax|sigmoid',                type=click.Choice(['softmax', 'sigmoid']), default='softmax', show_default=True)
 @click.option('--sigma-precond', help='Preconditioning of sigma loss', metavar='Eps|Dns',           type=click.Choice(['Eps', 'Dns']), default='Dns', show_default=True)
 @click.option('--dm-length',     help='sigma length', metavar='INT',                                type=click.IntRange(min=1), default=10, show_default=True)
+@click.option('--disc-finetune', help='Finetune EDM with original schedule and weights',            is_flag=True)
 
 # Hyperparameters.
 @click.option('--duration',      help='Training duration', metavar='MIMG',                          type=click.FloatRange(min=0, min_open=True), default=200, show_default=True)
@@ -151,6 +152,8 @@ def main(**kwargs):
         assert opts.precond == 'edm'    # DEFUALT
         c.network_kwargs.class_name = 'training.networks.EDMPrecond'
         c.loss_kwargs.class_name = 'training.loss.EDMLoss'
+    if opts.disc_finetune:
+        c.loss_kwargs.class_name = 'training.loss.EDMLoss_dis'
     train_func_name = 'training.training_loop.training_loop'
 
     # Network options.
@@ -218,7 +221,6 @@ def main(**kwargs):
         c.stage1_ticks = opts.stage1_ticks
         c.stage2_ticks = opts.stage2_ticks
     if opts.transfer is not None:
-        raise NotImplementedError('Transfer learning is not supported')
         if opts.resume is not None:
             raise click.ClickException('--transfer and --resume cannot be specified at the same time')
         c.resume_pkl = opts.transfer
