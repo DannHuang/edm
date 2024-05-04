@@ -68,6 +68,7 @@ def parse_int_list(s):
 @click.option('--stage1-ticks',  help='Stage 1 sigma learning duration', metavar='TICKS',           type=click.IntRange(min=1), default=4, show_default=True)
 @click.option('--stage2-ticks',  help='Stage 2 finetuning duration', metavar='TICKS',               type=click.IntRange(min=1), default=12, show_default=True)
 @click.option('--lr',            help='Learning rate', metavar='FLOAT',                             type=click.FloatRange(min=0, min_open=True), default=10e-4, show_default=True)
+@click.option('--sigma-lr',      help='Sigma learning rate', metavar='FLOAT',                       type=click.FloatRange(min=0, min_open=True), default=10e-3, show_default=True)
 @click.option('--ema',           help='EMA half-life', metavar='MIMG',                              type=click.FloatRange(min=0), default=0.5, show_default=True)
 @click.option('--dropout',       help='Dropout probability', metavar='FLOAT',                       type=click.FloatRange(min=0, max=1), default=0.13, show_default=True)
 @click.option('--augment',       help='Augment probability', metavar='FLOAT',                       type=click.FloatRange(min=0, max=1), default=0.12, show_default=True)
@@ -112,6 +113,8 @@ def main(**kwargs):
     c.network_kwargs = dnnlib.EasyDict()
     c.loss_kwargs = dnnlib.EasyDict()
     c.optimizer_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', lr=opts.lr, betas=[0.9,0.999], eps=1e-8)
+    if opts.sigma_lr is not None and opts.sigma_learning:
+        c.optimizer_kwargs.update(sigma_lr=opts.sigma_lr)
 
     # Validate dataset options.
     try:
@@ -153,6 +156,7 @@ def main(**kwargs):
         c.network_kwargs.class_name = 'training.networks.EDMPrecond'
         c.loss_kwargs.class_name = 'training.loss.EDMLoss'
     if opts.disc_finetune:
+        assert not opts.sigma_learning, "discrete finetuning should be conducted independently"
         c.loss_kwargs.class_name = 'training.loss.EDMLoss_dis'
     train_func_name = 'training.training_loop.training_loop'
 
@@ -178,9 +182,6 @@ def main(**kwargs):
         else:
             assert opts.sigma_arch=='sigmoid', f"Unknown sigma model {opts.sigma_arch}"
             c.sigma_network_kwargs.class_name = 'training.sigma_model.sigmoid_model'
-            # c.sigma_network_kwargs.sigma_max = opts.sigma_max
-            # c.sigma_network_kwargs.sigma_min = opts.sigma_min
-            # c.sigma_network_kwargs.rho = opts.rho
             c.loss_kwargs.class_name = 'training.sigma_loss.SigmoidLoss'
         c.loss_kwargs.update(mode=opts.sigma_precond, dm_length=opts.dm_length)
         c.sigma_network_kwargs.update(diffusion_length=opts.dm_length)

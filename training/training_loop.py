@@ -268,16 +268,12 @@ def sigma_training_loop(
                 p.requires_grad = False
             for p in model.sigma_model.parameters():
                 p.requires_grad = True
-            for g in optimizer.param_groups:
-                g['lr'] = optimizer_kwargs['lr'] * 100      # TODO: hyper-parameter
         else:
             dist.print0('Switching to stage 2: learning diffusion model')
             for p in model.diffusion.parameters():
                 p.requires_grad = True
             for p in model.sigma_model.parameters():
                 p.requires_grad = False
-            for g in optimizer.param_groups:
-                g['lr'] = optimizer_kwargs['lr'] * min(cur_nimg / max(lr_rampup_kimg * 1000, 1e-8), 1)
 
     # Initialize.
     start_time = time.time()
@@ -323,6 +319,7 @@ def sigma_training_loop(
             cur_sigma, next_sigma = sigma.chunk(2, dim=1)
             dist.print0(f"sigma model init with {[s.item() for s in cur_sigma.squeeze()]}")
 
+            # FIXME: disable dummy run if there is error with ddp.
             images = torch.zeros([batch_gpu, net.diffusion.img_channels, net.diffusion.img_resolution, net.diffusion.img_resolution], device=device)
             labels = torch.zeros([batch_gpu, net.diffusion.label_dim], device=device)
             sum_tensor = torch.zeros([batch_gpu, 2, net.sigma_model.dm_length - 1], device=device)
@@ -331,7 +328,16 @@ def sigma_training_loop(
     # Setup optimizer.
     dist.print0('Setting up optimizer...')
     loss_fn = dnnlib.util.construct_class_by_name(**loss_kwargs)
-    optimizer = dnnlib.util.construct_class_by_name(params=net.parameters(), **optimizer_kwargs) # subclass of torch.optim.Optimizer
+    diffusion_lr = optimizer_kwargs.pop('lr')
+    sigma_lr = optimizer_kwargs.pop('sigma_lr')
+    optimizer = dnnlib.util.construct_class_by_name(
+        params=[
+            {'params': net.diffusion.parameters(), 'lr': diffusion_lr},
+            {'params': net.sigma_model.parameters(), 'lr': sigma_lr}
+            ],
+        **optimizer_kwargs
+        )
+    # optimizer = dnnlib.util.construct_class_by_name(params=net.parameters(), **optimizer_kwargs) # subclass of torch.optim.Optimizer
     augment_pipe = dnnlib.util.construct_class_by_name(**augment_kwargs) if augment_kwargs is not None else None # training.augment.AugmentPipe
     ddp = torch.nn.parallel.DistributedDataParallel(net, device_ids=[device], find_unused_parameters=True)
     ema = copy.deepcopy(net).eval().requires_grad_(False)
@@ -392,18 +398,16 @@ def sigma_training_loop(
 
         # Update weights.
         if stage1:
-            for g in optimizer.param_groups:
-                g['lr'] = optimizer_kwargs['lr'] * min(np.exp(stage1_anneal_kimg / max(cur_nimg, 1e-8)), 100)
+            optimizer.param_groups[1]['lr'] = sigma_lr * max(np.exp(-cur_nimg / max(stage1_anneal_kimg, 1e-8)), 1)
             if dist.get_rank() == 0:
                 writer.add_scalar("lr/stage1",
-                                optimizer_kwargs['lr'] * min(np.exp(stage1_anneal_kimg / max(cur_nimg, 1e-8)), 100),
+                                optimizer.param_groups[1]['lr'],
                                 cur_nimg // 1000)
         else:
-            for g in optimizer.param_groups:
-                g['lr'] = optimizer_kwargs['lr'] * min(cur_nimg / max(lr_rampup_kimg * 1000, 1e-8), 1)
+            optimizer.param_groups[0]['lr'] = diffusion_lr * min(cur_nimg / max(lr_rampup_kimg * 1000, 1e-8), 1)
             if dist.get_rank() == 0:
                 writer.add_scalar("lr/stage2",
-                                optimizer_kwargs['lr'] * min(cur_nimg / max(lr_rampup_kimg * 1000, 1e-8), 1),
+                                optimizer.param_groups[0]['lr'],
                                 cur_nimg // 1000)
         for param in net.parameters():
             if param.grad is not None:

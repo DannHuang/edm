@@ -74,7 +74,7 @@ class softmax_model(nn.Module):
         return sigmas
 
 class softmax_model_batch(nn.Module):
-    def __init__(self, diffusion_length = 10, sigma_max = 80.0, sigma_min = 0.002, rho = 3.0, init='edm'):
+    def __init__(self, diffusion_length = 10, sigma_max = 80.0, sigma_min = 0.002, rho = 7.0, init='edm'):
         super().__init__()
         self.dm_length = diffusion_length      # sigma min/max is fixed, loss 2 degrees of freedom
         self.sigma_max = sigma_max

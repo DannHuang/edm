@@ -23,48 +23,33 @@ from torch_utils import distributed as dist
 # Our new 2nd-order sampler.
 
 def edm_sampler(
-    net, latents, class_labels=None, randn_like=torch.randn_like,
-    num_steps=18, sigma_min=0.002, sigma_max=80, rho=7,
+    net, latents, class_labels=None,
+    num_steps=10, sigma_min=0.002, sigma_max=80, rho=7,
     S_churn=0, S_min=0, S_max=float('inf'), S_noise=1,
 ):
 
     # # Adjust noise levels based on what's supported by the network.
     sigma_min = max(sigma_min, net.sigma_min)
     sigma_max = min(sigma_max, net.sigma_max)
-    A = torch.tensor(sigma_max**(1/rho), dtype=torch.float64)
-    B = torch.tensor(sigma_min**(1/rho) - sigma_max**(1/rho), dtype=torch.float64)
+    shift = torch.tensor(sigma_max**(1/rho), dtype=torch.float64)
+    scale = torch.tensor(sigma_min**(1/rho) - sigma_max**(1/rho), dtype=torch.float64)
 
     # # Time step discretization, turn time-steps into sigma-schedule.
     step_indices = torch.arange(num_steps, dtype=torch.float64, device=latents.device)  # [0,1,...,num_steps-1]
-    sigmas = (A + step_indices/(num_steps-1)*B).pow(rho)
+    sigmas = (shift + step_indices/(num_steps-1)*scale).pow(rho)
     sigmas = torch.cat([net.round_sigma(sigmas), torch.zeros_like(sigmas[:1])]) # t_steps[num_steps] = 0
+    dist.print0(f'Sampling with sigmas: {[s.item() for s in sigmas.squeeze()]}')
 
     # # Main sampling loop.
     x_next = latents.to(torch.float64) * sigmas[0]     # amplify to sigma_max variance
     for i, (sigma_cur, sigma_next) in enumerate(zip(sigmas[:-1], sigmas[1:])): # 0, ..., N-1
         x_cur = x_next
 
-        # # backward 2nd order sampling.
-        if i > 0 and sigma_cur >= S_max:
-            with fwAD.dual_level():
-                dual_x = fwAD.make_dual(x_cur, 0.5*dt*dt*gamma/sigma_cur*f_cur+diffusion_coff*noise[1]/sigma_cur)
-                dual_t = fwAD.make_dual(sigma_cur, 0.5*dt*dt/sigma_cur)
-                dual_out = net(dual_x, dual_t, class_labels)
-                denoised, jfp = fwAD.unpack_dual(dual_out)
-            jfp = (dt*dt*gamma/sigma_cur*f_cur + 0.5*dt*dt/sigma_cur*diffusion_coff*noise[0] + noise[1]/sigma_cur -jfp).to(torch.float64)    # 0.5*dt^2 * (x_next-x_cur)
-            f_cur = (x_cur - denoised) / sigma_cur
-            x_next = x_cur + (f_cur*dt + jfp)*gamma
-        else:
-            # # Euler step.
-            denoised = net(x_cur, sigma_cur, class_labels).to(torch.float64)
-            f_cur = (x_cur - denoised) / sigma_cur
-            # # v1.0 implementation
-            # dsigma = B*rho*(sigma_cur.pow((rho-1)/rho))
-            # ddsigma = rho*(rho-1)*B*B*(sigma_cur.pow((rho-2)/rho))
-            # g_cur = ddsigma*sigma_cur
-            # gamma = dsigma + 0.5*dt*ddsigma     
-            x_next = x_next + f_cur*gamma*dt
-        
+        # # Euler step.
+        denoised = net(x_cur, sigma_cur, class_labels).to(torch.float64)
+        eps = (x_cur - denoised) / sigma_cur
+        x_next = denoised + sigma_next * eps
+
         # if sigma_cur < S_min and i < num_steps - 1:
         #     denoised = net(x_next, sigma_next, class_labels).to(torch.float64)
         #     # gamma_next=torch.tensor(0.0, dtype=torch.float64, device=latents.device)
@@ -282,7 +267,6 @@ def parse_int_list(s):
 @click.option('--S_min', 'S_min',          help='Stoch. min noise level', metavar='FLOAT',                          type=click.FloatRange(min=0), default=0, show_default=True)
 @click.option('--S_max', 'S_max',          help='Stoch. max noise level', metavar='FLOAT',                          type=click.FloatRange(min=0), default='inf', show_default=True)
 @click.option('--S_noise', 'S_noise',      help='Stoch. noise inflation', metavar='FLOAT',                          type=float, default=1, show_default=True)
-# @click.option('--k',                       help='residual order of diffusion-coefficient', metavar='FLOAT',         type=click.FloatRange(min=0, min_open=False), default=0, show_default=True)
 @click.option('--randn_like',              help='Stoch. Brownian motions generator', metavar='db|ddb',              type=click.Choice(['db', 'ddb']), default='db')
 # ablation
 @click.option('--solver',                  help='Ablate ODE solver', metavar='euler|heun',                          type=click.Choice(['euler', 'heun']))
@@ -318,7 +302,7 @@ def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, device=
     # Load network.
     dist.print0(f'Loading network from local directorty "{network_pkl}"...')
     with open(network_pkl, 'rb') as f:
-        net = pickle.load(f).to(device)
+        net = pickle.load(f)['ema'].to(device)
 
     # Other ranks follow.
     if dist.get_rank() == 0:
