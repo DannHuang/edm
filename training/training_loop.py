@@ -373,7 +373,7 @@ def sigma_training_loop(
     stage_start_tick = cur_tick
     stage_ticks = stage1_ticks if stage1 else stage2_ticks
     switch_stage(net, stage1)
-    stage1_anneal_nimg = lr_anneal_kimg * 1000 / np.log(diffusion_lr/sigma_lr)
+    stage1_anneal_nimg = np.abs(lr_anneal_kimg * 1000 / np.log(diffusion_lr/sigma_lr))
 
     tick_start_time = time.time()
     maintain_time = tick_start_time - start_time
@@ -398,7 +398,7 @@ def sigma_training_loop(
 
         # Update weights.
         if stage1:
-            optimizer.param_groups[1]['lr'] = max(sigma_lr * np.exp(cur_nimg / max(stage1_anneal_nimg, 1e-8)), diffusion_lr)
+            optimizer.param_groups[1]['lr'] = max(sigma_lr * np.exp(-cur_nimg / max(stage1_anneal_nimg, 1e-8)), diffusion_lr)
             if dist.get_rank() == 0:
                 writer.add_scalar("lr/stage1",
                                 optimizer.param_groups[1]['lr'],
