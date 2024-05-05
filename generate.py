@@ -23,22 +23,23 @@ from torch_utils import distributed as dist
 # Our new 2nd-order sampler.
 
 def edm_sampler(
-    net, latents, class_labels=None,
+    net, latents, class_labels=None, sigmas=None,
     num_steps=10, sigma_min=0.002, sigma_max=80, rho=7,
     S_churn=0, S_min=0, S_max=float('inf'), S_noise=1,
 ):
 
-    # # Adjust noise levels based on what's supported by the network.
-    sigma_min = max(sigma_min, net.sigma_min)
-    sigma_max = min(sigma_max, net.sigma_max)
-    shift = torch.tensor(sigma_max**(1/rho), dtype=torch.float64)
-    scale = torch.tensor(sigma_min**(1/rho) - sigma_max**(1/rho), dtype=torch.float64)
+    if sigmas is None:
+        # # Adjust noise levels based on what's supported by the network.
+        sigma_min = max(sigma_min, net.sigma_min)
+        sigma_max = min(sigma_max, net.sigma_max)
+        shift = torch.tensor(sigma_max**(1/rho), dtype=torch.float64)
+        scale = torch.tensor(sigma_min**(1/rho) - sigma_max**(1/rho), dtype=torch.float64)
 
-    # # Time step discretization, turn time-steps into sigma-schedule.
-    step_indices = torch.arange(num_steps, dtype=torch.float64, device=latents.device)  # [0,1,...,num_steps-1]
-    sigmas = (shift + step_indices/(num_steps-1)*scale).pow(rho)
-    sigmas = torch.cat([net.round_sigma(sigmas), torch.zeros_like(sigmas[:1])]) # t_steps[num_steps] = 0
-    dist.print0(f'Sampling with sigmas: {[s.item() for s in sigmas.squeeze()]}')
+        # # Time step discretization, turn time-steps into sigma-schedule.
+        step_indices = torch.arange(num_steps, dtype=torch.float64, device=latents.device)  # [0,1,...,num_steps-1]
+        sigmas = (shift + step_indices/(num_steps-1)*scale).pow(rho)
+        sigmas = torch.cat([net.round_sigma(sigmas), torch.zeros_like(sigmas[:1])]) # t_steps[num_steps] = 0
+        dist.print0(f'Sampling with polynomial sigmas: {[s.item() for s in sigmas.squeeze()]}')
 
     # # Main sampling loop.
     x_next = latents.to(torch.float64) * sigmas[0]     # amplify to sigma_max variance
@@ -258,6 +259,7 @@ def parse_int_list(s):
 @click.option('--subdirs',                 help='Create subdirectory for every 1000 seeds',                         is_flag=True)
 @click.option('--class', 'class_idx',      help='Class label  [default: random]', metavar='INT',                    type=click.IntRange(min=0), default=None)
 @click.option('--batch', 'max_batch_size', help='Maximum batch size', metavar='INT',                                type=click.IntRange(min=1), default=64, show_default=True)
+@click.option('--sigma-model-pkl',         help='sigma model pickle filename', metavar='PATH|URL',                  type=str, default=None)
 # sampler
 @click.option('--steps', 'num_steps',      help='Number of sampling steps', metavar='INT',                          type=click.IntRange(min=1), default=18, show_default=True)
 @click.option('--sigma_min',               help='Lowest noise level  [default: varies]', metavar='FLOAT',           type=click.FloatRange(min=0, min_open=True))
@@ -267,14 +269,13 @@ def parse_int_list(s):
 @click.option('--S_min', 'S_min',          help='Stoch. min noise level', metavar='FLOAT',                          type=click.FloatRange(min=0), default=0, show_default=True)
 @click.option('--S_max', 'S_max',          help='Stoch. max noise level', metavar='FLOAT',                          type=click.FloatRange(min=0), default='inf', show_default=True)
 @click.option('--S_noise', 'S_noise',      help='Stoch. noise inflation', metavar='FLOAT',                          type=float, default=1, show_default=True)
-@click.option('--randn_like',              help='Stoch. Brownian motions generator', metavar='db|ddb',              type=click.Choice(['db', 'ddb']), default='db')
 # ablation
 @click.option('--solver',                  help='Ablate ODE solver', metavar='euler|heun',                          type=click.Choice(['euler', 'heun']))
 @click.option('--disc', 'discretization',  help='Ablate time step discretization {t_i}', metavar='vp|ve|iddpm|edm', type=click.Choice(['vp', 've', 'iddpm', 'edm']))
 @click.option('--schedule',                help='Ablate noise schedule sigma(t)', metavar='vp|ve|linear',           type=click.Choice(['vp', 've', 'linear']))
 @click.option('--scaling',                 help='Ablate signal scaling s(t)', metavar='vp|none',                    type=click.Choice(['vp', 'none']))
 
-def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, device=torch.device('cuda'), **sampler_kwargs):
+def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, sigma_model_pkl, device=torch.device('cuda'), **sampler_kwargs):
     """Generate random images using the techniques described in the paper
     "Elucidating the Design Space of Diffusion-Based Generative Models".
 
@@ -303,10 +304,40 @@ def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, device=
     dist.print0(f'Loading network from local directorty "{network_pkl}"...')
     with open(network_pkl, 'rb') as f:
         net = pickle.load(f)['ema'].to(device)
+    if hasattr(net, 'diffusion'): net = net.diffusion
 
     # Other ranks follow.
     if dist.get_rank() == 0:
         torch.distributed.barrier()
+
+    # Get learned sigmas if available.
+    if sigma_model_pkl is not None:
+        if dist.get_rank() != 0:
+            torch.distributed.barrier()
+
+        # Load network.
+        dist.print0(f'Loading sigma model from local directorty "{sigma_model_pkl}"...')
+        with open(sigma_model_pkl, 'rb') as f:
+            sigma_model = pickle.load(f)['ema'].to(device)
+        if hasattr(sigma_model, 'sigma_model'): sigma_model = sigma_model.sigma_model
+
+        # Other ranks follow.
+        if dist.get_rank() == 0:
+            torch.distributed.barrier()
+
+        # Create learned schedule.
+        with torch.no_grad():
+            t = np.array([i for i in range(sigma_model.dm_length)])
+            index = [[j for j in range(i)] for i in t]
+            summation_vec = np.zeros([sigma_model.dm_length, sigma_model.dm_length - 1])
+            summation_vec_next = np.zeros([sigma_model.dm_length, sigma_model.dm_length - 1])
+            for i in range(sigma_model.dm_length):
+                summation_vec[i, index[i]] = 1
+            summation_tensor = torch.stack((torch.from_numpy(summation_vec), torch.from_numpy(summation_vec_next)), dim=1).to(torch.float32)
+            sigma = sigma_model(summation_tensor.to(device))
+            sigmas, _ = sigma.chunk(2, dim=1)
+            sigmas = torch.cat([sigmas, torch.zeros_like(sigmas[:1])])
+            dist.print0(f'Sampling with sigmas: {[s.item() for s in sigmas.squeeze()]}')
 
     # Loop over batches.
     dist.print0(f'Generating {len(seeds)} images to "{outdir}"...')
@@ -329,8 +360,8 @@ def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, device=
         # Generate images.
         sampler_kwargs = {key: value for key, value in sampler_kwargs.items() if value is not None}     # unwrap kwargs, withdraw non-stated params
         have_ablation_kwargs = any(x in sampler_kwargs for x in ['solver', 'discretization', 'schedule', 'scaling'])
-        if 'randn_like' in sampler_kwargs and type(sampler_kwargs['randn_like']) is str:
-            sampler_kwargs['randn_like'] = rnd.randn_like if sampler_kwargs['randn_like'] == 'db' else rnd.multiGaussian_like
+        if sigma_model_pkl is not None:
+            sampler_kwargs['sigmas'] = sigmas
         sampler_fn = ablation_sampler if have_ablation_kwargs else edm_sampler
         images = sampler_fn(net, latents, class_labels, **sampler_kwargs)
 

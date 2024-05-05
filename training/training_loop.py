@@ -373,7 +373,7 @@ def sigma_training_loop(
     stage_start_tick = cur_tick
     stage_ticks = stage1_ticks if stage1 else stage2_ticks
     switch_stage(net, stage1)
-    stage1_anneal_kimg = np.log(100) * lr_anneal_kimg * 1000
+    stage1_anneal_nimg = lr_anneal_kimg * 1000 / np.log(diffusion_lr/sigma_lr)
 
     tick_start_time = time.time()
     maintain_time = tick_start_time - start_time
@@ -398,7 +398,7 @@ def sigma_training_loop(
 
         # Update weights.
         if stage1:
-            optimizer.param_groups[1]['lr'] = sigma_lr * max(np.exp(-cur_nimg / max(stage1_anneal_kimg, 1e-8)), 1)
+            optimizer.param_groups[1]['lr'] = max(sigma_lr * np.exp(cur_nimg / max(stage1_anneal_nimg, 1e-8)), diffusion_lr)
             if dist.get_rank() == 0:
                 writer.add_scalar("lr/stage1",
                                 optimizer.param_groups[1]['lr'],
@@ -482,7 +482,7 @@ def sigma_training_loop(
             stats_jsonl.write(json.dumps(dict(training_stats.default_collector.as_dict(), timestamp=time.time())) + '\n')
             stats_jsonl.flush()
             # visual samples
-            images = net.sample(device=device)
+            images = ema.sample(device=device)
             images = (images + 1.) / 2.
             img_grid = torchvision.utils.make_grid(images)
             writer.add_image('samples', img_grid, cur_tick)
