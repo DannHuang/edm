@@ -67,6 +67,57 @@ def edm_sampler(
 # Generalized ablation sampler, representing the superset of all sampling
 # methods discussed in the paper.
 
+def dpm_solver_2(
+    net, latents, class_labels=None, sigmas=None,
+    num_steps=10, sigma_min=0.002, sigma_max=80, rho=7,
+    r=0.5, afs=False, return_inters=False, denoise_to_zero=True
+):
+
+    if sigmas is None:
+        # # Adjust noise levels based on what's supported by the network.
+        sigma_min = max(sigma_min, net.sigma_min)
+        sigma_max = min(sigma_max, net.sigma_max)
+        shift = torch.tensor(sigma_max**(1/rho), dtype=torch.float64)
+        scale = torch.tensor(sigma_min**(1/rho) - sigma_max**(1/rho), dtype=torch.float64)
+
+        # # Time step discretization, turn time-steps into sigma-schedule.
+        step_indices = torch.arange(num_steps, dtype=torch.float64, device=latents.device)  # [0,1,...,num_steps-1]
+        sigmas = (shift + step_indices/(num_steps-1)*scale).pow(rho)
+        sigmas = torch.cat([net.round_sigma(sigmas), torch.zeros_like(sigmas[:1])]) # t_steps[num_steps] = 0
+        dist.print0(f'Sampling with polynomial sigmas: {[s.item() for s in sigmas.squeeze()]}')
+
+    # # Main sampling loop.
+    x_next = latents.to(torch.float64) * sigmas[0]     # amplify to sigma_max variance
+    inters = [x_next.unsqueeze(0)]
+    for i, (sigma_cur, sigma_next) in enumerate(zip(sigmas[:-1], sigmas[1:])): # 0, ..., N-1
+        x_cur = x_next
+
+        # # Euler step.
+        use_afs = (afs and i == 0)
+        if use_afs:
+            d_cur = x_cur / ((1 + sigma_cur**2).sqrt())
+        else:
+            denoised = net(x_cur, sigma_cur, class_labels).to(torch.float64)
+            d_cur = (x_cur - denoised) / sigma_cur
+        sigma_mid = (sigma_next ** r) * (sigma_cur ** (1 - r))
+        x_next = x_cur + (sigma_mid - sigma_cur) * d_cur
+
+        # Apply 2nd order correction.
+        denoised = net(x_next, sigma_mid, class_labels=class_labels)
+        d_prime = (x_next - denoised) / sigma_mid
+        x_next = x_cur + (sigma_next - sigma_cur) * ((1 / (2*r)) * d_prime + (1 - 1 / (2*r)) * d_cur)
+        if return_inters:
+            inters.append(x_next.unsqueeze(0))
+
+    if denoise_to_zero:
+        x_next = net(x_next, sigma_next, class_labels=class_labels)
+        if return_inters:
+            inters.append(x_next.unsqueeze(0))
+
+    if return_inters:
+        return torch.cat(inters, dim=0).to(latents.device)
+    return x_next
+
 def ablation_sampler(
     net, latents, class_labels=None, randn_like=torch.randn_like,
     num_steps=18, sigma_min=None, sigma_max=None, rho=7,

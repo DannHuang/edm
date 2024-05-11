@@ -312,26 +312,24 @@ def parse_int_list(s):
 @click.command()
 @click.option('--network', 'network_pkl',  help='Network pickle filename', metavar='PATH|URL',                      type=str, required=True)
 @click.option('--outdir',                  help='Where to save the output images', metavar='DIR',                   type=str, required=True)
-@click.option('--seeds',                   help='Random seeds (e.g. 1,2,5-10)', metavar='LIST',                     type=parse_int_list, default='0-63', show_default=True)
 @click.option('--subdirs',                 help='Create subdirectory for every 1000 seeds',                         is_flag=True)
-@click.option('--class', 'class_idx',      help='Class label  [default: random]', metavar='INT',                    type=click.IntRange(min=0), default=None)
+@click.option('--seeds',                   help='Random seeds (e.g. 1,2,5-10)', metavar='LIST',                     type=parse_int_list, default='0-63', show_default=True)
+# # sampler
+@click.option('--sampler',                 help='Ablate ODE solver', metavar='euler|heun|dpm2|ipndm_v|ipndm',       type=click.Choice(['euler', 'dpm2', 'heun', 'ipndm', 'ipndm_v']), default='euler')
 @click.option('--batch', 'max_batch_size', help='Maximum batch size', metavar='INT',                                type=click.IntRange(min=1), default=64, show_default=True)
-# sampler
-@click.option('--steps', 'num_steps',      help='Number of sampling steps', metavar='INT',                          type=click.IntRange(min=1), default=18, show_default=True)
-@click.option('--sigma_min',               help='Lowest noise level  [default: varies]', metavar='FLOAT',           type=click.FloatRange(min=0, min_open=True))
-@click.option('--sigma_max',               help='Highest noise level  [default: varies]', metavar='FLOAT',          type=click.FloatRange(min=0, min_open=True))
-@click.option('--rho',                     help='Time step exponent', metavar='FLOAT',                              type=click.FloatRange(min=0, min_open=True), default=7, show_default=True)
+@click.option('--class', 'class_idx',      help='Class label  [default: random]', metavar='INT',                    type=click.IntRange(min=0), default=None)
+@click.option('--afs',                     help='Whether or not to use analytic first step',                        is_flag=True)
+@click.option('--inters', 'return_inters', help='Whether or not to return diffusion process',                       is_flag=True)
+@click.option('--zero', 'denoise_to_zero', help='Whether or not to do final denoise',                               type=bool, default=True)
+# edm
 @click.option('--S_churn', 'S_churn',      help='Stochasticity strength', metavar='FLOAT',                          type=click.FloatRange(min=0), default=0, show_default=True)
 @click.option('--S_min', 'S_min',          help='Stoch. min noise level', metavar='FLOAT',                          type=click.FloatRange(min=0), default=0, show_default=True)
 @click.option('--S_max', 'S_max',          help='Stoch. max noise level', metavar='FLOAT',                          type=click.FloatRange(min=0), default='inf', show_default=True)
 @click.option('--S_noise', 'S_noise',      help='Stoch. noise inflation', metavar='FLOAT',                          type=float, default=1, show_default=True)
-# @click.option('--k',                       help='residual order of diffusion-coefficient', metavar='FLOAT',         type=click.FloatRange(min=0, min_open=False), default=0, show_default=True)
-@click.option('--randn_like',              help='Stoch. Brownian motions generator', metavar='db|ddb',              type=click.Choice(['db', 'ddb']), default='db')
-# ablation
-@click.option('--solver',                  help='Ablate ODE solver', metavar='euler|heun',                          type=click.Choice(['euler', 'heun']))
-@click.option('--disc', 'discretization',  help='Ablate time step discretization {t_i}', metavar='vp|ve|iddpm|edm', type=click.Choice(['vp', 've', 'iddpm', 'edm']))
-@click.option('--schedule',                help='Ablate noise schedule sigma(t)', metavar='vp|ve|linear',           type=click.Choice(['vp', 've', 'linear']))
-@click.option('--scaling',                 help='Ablate signal scaling s(t)', metavar='vp|none',                    type=click.Choice(['vp', 'none']))
+# dpm solver
+@click.option('--r',                       help='dpm solver hyper parameter', metavar='FLOAT',                      type=click.FloatRange(min=0, max=1), default=0.5, show_default=True)
+# ipndm
+@click.option('--order', 'max_order',      help='PNDM order', metavar='INT',                                        type=click.IntRange(min=1, max=4), default=4, show_default=True)
 
 def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, device=torch.device('cuda'), **sampler_kwargs):
     """Generate random images using the techniques described in the paper
@@ -369,23 +367,22 @@ def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, device=
 
     # Loop over batches.
     dist.print0(f'Generating {len(seeds)} images to "{outdir}"...')
+    dist.print0(f'Sampling with {sampler_kwargs['sampler']}')
     for batch_seeds in tqdm.tqdm(rank_batches, unit='batch', disable=(dist.get_rank() != 0)):
         torch.distributed.barrier()
         batch_size = len(batch_seeds)
         if batch_size == 0:
             continue
+        sampler_kwargs['batch_size'] = batch_size
+        sampler_kwargs['class_idx'] = class_idx
+        sampler_kwargs['device'] = device
+        sampler_kwargs['seeds'] = batch_seeds
 
-        # Pick latents and labels.
-        images = net.sample(batch_size=batch_size, class_idx=class_idx, device=device, seeds=batch_seeds)
+        images = net.sample(**sampler_kwargs)
 
         # Save images.
         images_np = (images * 127.5 + 128).clip(0, 255).to(torch.uint8).permute(0, 2, 3, 1).cpu().numpy()
 
-        # # Save batch images
-        # images_dir = os.path.join(outdir, f'{class_idx:02d}') if subdirs else outdir
-        # os.makedirs(images_dir, exist_ok=True)
-        # images_path = os.path.join(images_dir, f'{class_idx:02d}.png')
-        # PIL.Image.fromarray(images_np, 'RGB').save(images_path)
         for seed, image_np in zip(batch_seeds, images_np):
             image_dir = os.path.join(outdir, f'{seed-seed%1000:06d}') if subdirs else outdir
             os.makedirs(image_dir, exist_ok=True)

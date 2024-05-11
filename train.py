@@ -91,17 +91,7 @@ def parse_int_list(s):
 @click.option('-n', '--dry-run', help='Print training options and exit',                            is_flag=True)
 
 def main(**kwargs):
-    """Finetune pretrained diffusion models from the paper
-    "Elucidating the Design Space of Diffusion-Based Generative Models".
 
-    Examples:
-
-    \b
-    # Train DDPM++ model for class-conditional CIFAR-10 using 8 GPUs
-    torchrun --standalone --nproc_per_node=8 train.py --outdir=./logs --data=./data \\
-        --cond=1 --arch=adm --duration=2500 --batch=4096 batch-gpu=64 --lr=1e-4 --ema=50 \\
-        --dropout=0.10 --augment=0 --fp16=1 --ls=100 --tick=200
-    """
     opts = dnnlib.EasyDict(kwargs)
     torch.multiprocessing.set_start_method('spawn')
     dist.init()
